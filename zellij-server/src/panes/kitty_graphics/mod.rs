@@ -1,11 +1,13 @@
 pub mod grid_state;
 pub mod interceptor;
 pub mod parser;
+pub mod placeholders;
 pub mod replies;
 pub mod store;
 pub use grid_state::*;
 pub use interceptor::*;
 pub use parser::*;
+pub use placeholders::*;
 pub use replies::*;
 pub use store::*;
 
@@ -14,6 +16,9 @@ pub struct KittyHostCapability {
     pub graphics: bool,
     pub zlib: bool,
 }
+
+/// The kitty protocol's sentinel for an absent placement id.
+pub const NO_PLACEMENT_ID: u32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KittyHostSupport {
