@@ -14,6 +14,8 @@ pub type InternalImageId = u64;
 pub struct ScaledImageKey {
     pub source: PixelRect,
     pub size: (usize, usize),
+    /// Distinguish aspect-fitted placeholders from stretched placements.
+    pub letterbox: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

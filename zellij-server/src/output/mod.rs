@@ -225,7 +225,12 @@ fn serialize_chunks_with_newlines(
             )
             .with_context(err_context)?;
             chunk_width += t_character.width();
-            t_character.push_text_to(&mut vte_output);
+            // Render encoded image placeholders as spaces while preserving text graphemes.
+            if crate::panes::kitty_graphics::is_in_encoded_range(t_character.character) {
+                vte_output.push(' ');
+            } else {
+                t_character.push_text_to(&mut vte_output);
+            }
         }
     }
     Ok(vte_output)
@@ -1053,7 +1058,9 @@ fn serialize_chunks(
                 &mut vte_output,
             )
             .with_context(err_context)?;
-            if unit_end == index + 1 && !t_character.has_attached() {
+            if crate::panes::kitty_graphics::is_in_encoded_range(t_character.character) {
+                vte_output.push(' ');
+            } else if unit_end == index + 1 && !t_character.has_attached() {
                 vte_output.push(t_character.character);
             } else {
                 write_unit_text(&mut vte_output, unit, unit_columns, chunk_width)

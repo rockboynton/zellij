@@ -1703,6 +1703,7 @@ fn kitty_local_media_carries_the_scaled_variant_when_the_chunk_names_one() {
             height: 40,
         },
         size: (20, 30),
+        letterbox: false,
     };
     parts
         .0
