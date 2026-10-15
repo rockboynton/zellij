@@ -2390,6 +2390,9 @@ impl Grid {
     ) -> Option<KittyImageChunk> {
         use crate::panes::kitty_graphics::grid_state::fit_rgba_into_box;
         use crate::panes::kitty_graphics::store::ScaledImageKey;
+        if cell.width == 0 || cell.height == 0 {
+            return None;
+        }
         let placement = self
             .kitty_grid
             .virtual_placement(run.image_id, run.placement_id)?;
@@ -2404,23 +2407,23 @@ impl Grid {
         // Sizing mirrors place(): a missing c= or r= is derived from
         // the image's aspect ratio at the given axis, both missing
         // means the image's own pixel size.
-        let ceil_div = |a: usize, b: usize| (a + b - 1) / b;
+        let ceil_div = |a: usize, b: usize| a.div_ceil(b);
         let (columns, rows) = match (placement.columns as usize, placement.rows as usize) {
             (0, 0) => (
                 std::cmp::max(ceil_div(image_width, cell.width), 1),
                 std::cmp::max(ceil_div(image_height, cell.height), 1),
             ),
             (columns, 0) => {
-                let height_px =
-                    (columns * cell.width) as f64 * image_height as f64 / image_width as f64;
+                let height_px = columns.checked_mul(cell.width)? as f64 * image_height as f64
+                    / image_width as f64;
                 (
                     columns,
                     std::cmp::max((height_px / cell.height as f64).ceil() as usize, 1),
                 )
             },
             (0, rows) => {
-                let width_px =
-                    (rows * cell.height) as f64 * image_width as f64 / image_height as f64;
+                let width_px = rows.checked_mul(cell.height)? as f64 * image_width as f64
+                    / image_height as f64;
                 (
                     std::cmp::max((width_px / cell.width as f64).ceil() as usize, 1),
                     rows,
@@ -2433,8 +2436,11 @@ impl Grid {
         }
         // Bound allocations before fitting. The key includes the pixel size
         // and fit mode so resizing and positioned placements cannot alias it.
-        let scaled_width = (columns * cell.width);
-        let scaled_height = (rows * cell.height);
+        if columns > 0x7FFF || rows > 0x7FFF {
+            return None;
+        }
+        let scaled_width = columns.checked_mul(cell.width)?;
+        let scaled_height = rows.checked_mul(cell.height)?;
         let scaled_image = ScaledImageKey {
             source: PixelRect {
                 x: 0,
@@ -2445,7 +2451,10 @@ impl Grid {
             size: (scaled_width, scaled_height),
             letterbox: true,
         };
-        let raster_bytes = scaled_width * scaled_height * 4;
+        let raster_bytes = scaled_width.checked_mul(scaled_height)?.checked_mul(4)?;
+        if raster_bytes > 64 * 1024 * 1024 {
+            return None;
+        }
         let needs_variant = match store
             .borrow()
             .scaled_variant(placement.internal_id, scaled_image)
