@@ -6788,6 +6788,81 @@ fn kitty_cursor_unmoved_with_c1() {
 }
 
 #[test]
+fn kitty_unicode_neohelix_two_step_placement_tracks_visible_cells() {
+    let (mut grid, store) = new_kitty_grid(10, 10);
+    let mut parser = vte::Parser::new();
+    let mut interceptor = KittyApcInterceptor::new();
+    for bytes in [
+        kitty_apc("a=t,f=100,i=42,q=2", &KITTY_PNG_2X2),
+        kitty_apc("a=p,U=1,i=42,p=1,c=2,r=2,q=2", &[]),
+        "\x1b[38;2;0;0;42m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\x1b[2;1H\u{10eeee}\u{030d}\u{0305}\u{10eeee}\u{030d}\u{030d}".as_bytes().to_vec(),
+    ] {
+        feed_kitty_bytes(&mut grid, &mut parser, &mut interceptor, &bytes);
+    }
+    let chunks = grid.placeholder_kitty_chunks(3, 4);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!((chunks[0].cell_x, chunks[0].cell_y), (3, 4));
+    assert_eq!((chunks[1].cell_x, chunks[1].cell_y), (3, 5));
+    assert_eq!(
+        (chunks[0].source_px_width, chunks[0].source_px_height),
+        (20, 20)
+    );
+    assert_eq!(chunks[1].source_px_y, 20);
+    grid.change_size(12, 12);
+    assert_eq!(grid.placeholder_kitty_chunks(0, 0).len(), 2);
+    // A popup or ordinary text overwrites cells, not a separate image layer.
+    feed_kitty_bytes(&mut grid, &mut parser, &mut interceptor, b"\x1b[1;1HX");
+    let chunks = grid.placeholder_kitty_chunks(0, 0);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!((chunks[0].cell_x, chunks[0].source_px_x), (1, 10));
+    feed_kitty_bytes(&mut grid, &mut parser, &mut interceptor, b"\x1b[1S");
+    let chunks = grid.placeholder_kitty_chunks(0, 0);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!((chunks[0].cell_y, chunks[0].source_px_y), (0, 20));
+    feed_kitty_bytes(
+        &mut grid,
+        &mut parser,
+        &mut interceptor,
+        &kitty_apc("a=d,d=I,i=42,q=2", &[]),
+    );
+    assert!(grid.placeholder_kitty_chunks(0, 0).is_empty());
+    assert_eq!(store.borrow().image_count(), 0);
+}
+
+#[test]
+fn kitty_unicode_rejects_oversized_virtual_rasters_before_allocation() {
+    let (mut grid, _) = new_kitty_grid(10, 10);
+    let mut parser = vte::Parser::new();
+    let mut interceptor = KittyApcInterceptor::new();
+    feed_kitty_bytes(
+        &mut grid,
+        &mut parser,
+        &mut interceptor,
+        &kitty_apc("a=t,f=100,i=42,q=2", &KITTY_PNG_2X2),
+    );
+    feed_kitty_bytes(
+        &mut grid,
+        &mut parser,
+        &mut interceptor,
+        "\x1b[38;2;0;0;42m\u{10eeee}\u{0305}\u{0305}".as_bytes(),
+    );
+    for geometry in [
+        "c=4294967295,r=4294967295",
+        "c=32767,r=32767",
+        "c=4294967295",
+        "r=4294967295",
+    ] {
+        feed_kitty_bytes(
+            &mut grid,
+            &mut parser,
+            &mut interceptor,
+            &kitty_apc(&format!("a=p,U=1,i=42,p=1,q=2,{geometry}"), &[]),
+        );
+        assert!(grid.placeholder_kitty_chunks(0, 0).is_empty(), "{geometry}");
+    }
+}
+
+#[test]
 fn kitty_placeholder_diacritic_sequence_is_invalidated_by_cursor_reposition() {
     use crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
     let (mut grid, _kitty_image_store) = new_kitty_grid(10, 10);

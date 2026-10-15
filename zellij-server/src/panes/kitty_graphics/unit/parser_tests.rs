@@ -237,6 +237,15 @@ fn unicode_placeholder_key_absent_or_zero_is_not_flagged() {
 }
 
 #[test]
+fn invalid_unicode_placeholder_modes_are_rejected() {
+    for mode in ["2", "4294967295", "invalid"] {
+        let mut parser = KittyCommandParser::new();
+        let command = format!("a=p,U={mode},i=42");
+        assert!(parse_one(&mut parser, command.as_bytes()).is_err());
+    }
+}
+
+#[test]
 fn shared_memory_medium_is_enotsupported() {
     let mut parser = KittyCommandParser::new();
     let err = parse_one(&mut parser, &raw_cmd("a=T,t=s,s=1,v=1", b"/x")).unwrap_err();

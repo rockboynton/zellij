@@ -2075,6 +2075,9 @@ impl Grid {
         run: PlaceholderRun,
     ) -> Option<KittyImageChunk> {
         use crate::panes::kitty_graphics::grid_state::fit_rgba_into_box;
+        if cell.width == 0 || cell.height == 0 {
+            return None;
+        }
         let placement = self
             .kitty_grid
             .virtual_placement(run.image_id, run.placement_id)?;
@@ -2089,23 +2092,23 @@ impl Grid {
         // Sizing mirrors place(): a missing c= or r= is derived from
         // the image's aspect ratio at the given axis, both missing
         // means the image's own pixel size.
-        let ceil_div = |a: usize, b: usize| (a + b - 1) / b;
+        let ceil_div = |a: usize, b: usize| a.div_ceil(b);
         let (columns, rows) = match (placement.columns as usize, placement.rows as usize) {
             (0, 0) => (
                 std::cmp::max(ceil_div(image_width, cell.width), 1),
                 std::cmp::max(ceil_div(image_height, cell.height), 1),
             ),
             (columns, 0) => {
-                let height_px =
-                    (columns * cell.width) as f64 * image_height as f64 / image_width as f64;
+                let height_px = columns.checked_mul(cell.width)? as f64 * image_height as f64
+                    / image_width as f64;
                 (
                     columns,
                     std::cmp::max((height_px / cell.height as f64).ceil() as usize, 1),
                 )
             },
             (0, rows) => {
-                let width_px =
-                    (rows * cell.height) as f64 * image_width as f64 / image_height as f64;
+                let width_px = rows.checked_mul(cell.height)? as f64 * image_width as f64
+                    / image_height as f64;
                 (
                     std::cmp::max((width_px / cell.width as f64).ceil() as usize, 1),
                     rows,
@@ -2121,19 +2124,25 @@ impl Grid {
         // bit namespaces placeholder variants away from positioned
         // placements of the same image, whose bytes are cropped
         // differently under the same cell count.
-        let dest_cells = (
-            (columns as u16).min(0x7FFF) | 0x8000,
-            (rows as u16).min(0x7FFF),
-        );
-        let scaled_width = columns * cell.width;
-        let scaled_height = rows * cell.height;
+        // Keep the placeholder cache namespace distinct and bound allocations
+        // before fitting. Geometry is supplied by the application, not trusted.
+        if columns > 0x7FFF || rows > 0x7FFF {
+            return None;
+        }
+        let dest_cells = (columns as u16 | 0x8000, rows as u16);
+        let scaled_width = columns.checked_mul(cell.width)?;
+        let scaled_height = rows.checked_mul(cell.height)?;
+        let raster_bytes = scaled_width.checked_mul(scaled_height)?.checked_mul(4)?;
+        if raster_bytes > 64 * 1024 * 1024 {
+            return None;
+        }
         let needs_variant = match store
             .borrow()
             .scaled_variant(placement.internal_id, dest_cells)
         {
             // The character cell size may have changed since the
             // variant was generated; the byte length is the tell.
-            Some(bytes) => bytes.len() != scaled_width * scaled_height * 4,
+            Some(bytes) => bytes.len() != raster_bytes,
             None => true,
         };
         if needs_variant {

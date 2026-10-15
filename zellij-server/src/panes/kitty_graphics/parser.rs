@@ -493,8 +493,11 @@ pub fn parse_control_data(control: &[u8]) -> Result<KittyCommand, KittyError> {
             },
             b"U" => match parse_u32(value) {
                 Some(0) => {},
-                Some(_) => {
+                Some(1) => {
                     command.unicode_placeholder = true;
+                },
+                Some(_) => {
+                    return Err(echo.error(KittyErrorCode::Einval, "invalid value for key 'U'"));
                 },
                 None => {
                     return Err(echo.error(KittyErrorCode::Einval, "invalid value for key 'U'"));

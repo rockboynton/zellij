@@ -224,6 +224,8 @@ fn handle_openpty(
         command
             .args(&cmd.args)
             .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
+            // Fork capability marker: the server can interpret Kitty U=1 cells.
+            .env("ZELLIJ_KITTY_UNICODE_PLACEHOLDERS", "1")
             .pre_exec(move || -> io::Result<()> {
                 if libc::login_tty(pid_secondary) != 0 {
                     panic!("failed to set controlling terminal");
