@@ -449,7 +449,7 @@ fn emit_kitty_transmit(
         if part_index == 0 {
             write!(
                 out,
-                "\u{1b}_Ga=t,q=2,f=32,t=d,i={},s={},v={},m={};{}\u{1b}\\",
+                "\u{1b}_Ga=t,q=2,f=32,o=z,t=d,i={},s={},v={},m={};{}\u{1b}\\",
                 host_image_id,
                 width,
                 height,
@@ -582,7 +582,9 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                         Some(dims) => dims,
                         None => continue,
                     };
-                    let b64 = match kitty_image_store.base64_for(chunk.internal_image_id, variant) {
+                    let b64 = match kitty_image_store
+                        .compressed_base64_for(chunk.internal_image_id, variant)
+                    {
                         Some(b64) => b64,
                         None => continue,
                     };

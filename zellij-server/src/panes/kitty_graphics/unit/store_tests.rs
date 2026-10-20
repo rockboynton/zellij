@@ -1,5 +1,42 @@
 use super::*;
 
+#[test]
+fn compressed_host_payload_round_trips_and_invalidates_scaled_cache() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use flate2::read::ZlibDecoder;
+    use std::io::Read as _;
+
+    let mut store = KittyImageStore::default();
+    let id = store.store_image(rgba_image(1280, 720)).unwrap();
+    let payload = store.compressed_base64_for(id, None).unwrap();
+    assert!(
+        payload.len() < 32_000,
+        "solid preview must not emit megabytes"
+    );
+    assert_eq!(payload, store.compressed_base64_for(id, None).unwrap());
+    let decode = |encoded: String| {
+        let compressed = STANDARD.decode(encoded).unwrap();
+        let mut decoded = vec![];
+        ZlibDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        decoded
+    };
+    assert_eq!(decode(payload), store.get(id).unwrap().rgba);
+    let cells = (0x8000 | 104, 49);
+    store.add_scaled_variant(id, cells, vec![7; 4096]);
+    assert_eq!(
+        decode(store.compressed_base64_for(id, Some(cells)).unwrap()),
+        vec![7; 4096]
+    );
+    store.add_scaled_variant(id, cells, vec![9; 4096]);
+    assert_eq!(
+        decode(store.compressed_base64_for(id, Some(cells)).unwrap()),
+        vec![9; 4096]
+    );
+}
+
 fn rgba_image(width: u32, height: u32) -> DecodedImage {
     DecodedImage {
         bytes: vec![0; (width * height * 4) as usize],

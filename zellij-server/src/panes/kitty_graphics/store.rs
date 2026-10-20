@@ -1,5 +1,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64_ENCODER;
 use base64::engine::Engine as _;
+use flate2::{write::ZlibEncoder, Compression};
+use std::io::Write as _;
 
 use super::parser::{DecodedImage, KittyError, KittyErrorCode, KittyFormat};
 use std::collections::HashMap;
@@ -129,7 +131,10 @@ impl KittyImageStore {
             self.remove_entry(id);
         }
     }
-    pub fn base64_for(
+    /// Cached zlib-compressed RGBA, base64 encoded for Kitty's `o=z` transport.
+    /// Raw preview-sized RGBA can otherwise block the client output loop with
+    /// megabytes of terminal traffic, even for a tiny source PNG.
+    pub fn compressed_base64_for(
         &mut self,
         id: InternalImageId,
         variant: Option<(u16, u16)>,
@@ -142,7 +147,10 @@ impl KittyImageStore {
             Some(cells) => stored.image.scaled_variants.get(&cells)?,
             None => &stored.image.rgba,
         };
-        let encoded = BASE64_ENCODER.encode(bytes);
+        let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
+        compressor.write_all(bytes).ok()?;
+        let compressed = compressor.finish().ok()?;
+        let encoded = BASE64_ENCODER.encode(compressed);
         stored.base64_cache.insert(variant, encoded.clone());
         Some(encoded)
     }

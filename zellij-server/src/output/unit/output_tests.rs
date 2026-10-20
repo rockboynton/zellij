@@ -1284,6 +1284,55 @@ fn parse_kitty_placement_crops(output: &str) -> Vec<(usize, usize, usize, usize,
 }
 
 #[test]
+fn kitty_compressed_transmit_round_trips_across_chunks() {
+    use crate::panes::kitty_graphics::parser::KittyCommandParser;
+    use crate::panes::kitty_graphics::store::KittyImageStore;
+
+    // Incompressible pixels exercise the multi-chunk path; a flat preview
+    // exercises the single-chunk path. Both must arrive byte-for-byte intact.
+    for noisy in [false, true] {
+        let mut pixels = vec![0; 128 * 128 * 4];
+        let mut random = 0x12345678u32;
+        if noisy {
+            for byte in &mut pixels {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                *byte = random as u8;
+            }
+        }
+        let mut store = KittyImageStore::default();
+        let id = store
+            .store_image(crate::panes::kitty_graphics::parser::DecodedImage {
+                bytes: pixels.clone(),
+                width: 128,
+                height: 128,
+                format: crate::panes::kitty_graphics::parser::KittyFormat::Rgba32,
+            })
+            .unwrap();
+        let payload = store.compressed_base64_for(id, None).unwrap();
+        let mut output = String::new();
+        crate::output::emit_kitty_transmit(&mut output, 42, 128, 128, &payload).unwrap();
+        assert!(output.contains("f=32,o=z,"));
+        let mut parser = KittyCommandParser::new();
+        let mut decoded = None;
+        let mut chunks = 0;
+        for part in output.split("\u{1b}_G").skip(1) {
+            let raw = part.strip_suffix("\u{1b}\\").unwrap();
+            let (_, chunk) = raw.split_once(';').unwrap();
+            assert!(chunk.len() <= 4096);
+            chunks += 1;
+            if let Some(command) = parser.parse(raw.as_bytes()) {
+                assert!(decoded.is_none());
+                decoded = command.unwrap().image;
+            }
+        }
+        assert_eq!(decoded.unwrap().bytes, pixels);
+        assert_eq!(chunks > 1, noisy);
+    }
+}
+
+#[test]
 fn kitty_transmit_only_once_across_frames() {
     let parts = create_test_kitty_parts();
     let internal = store_test_kitty_image(&parts.0, 30, 40);
@@ -1301,8 +1350,7 @@ fn kitty_placement_bytes_with_negative_z() {
     let mut chunk = kitty_chunk(internal, 1, 5, 3);
     chunk.z_index = -1;
     let output = run_kitty_frame(&parts, vec![chunk], None);
-    assert!(output.contains("\u{1b}_Ga=t,q=2,f=32,t=d,i=2000000000,s=30,v=40,m=1;"));
-    assert!(output.contains("\u{1b}_Gq=2,m=0;"));
+    assert!(output.contains("\u{1b}_Ga=t,q=2,f=32,o=z,t=d,i=2000000000,s=30,v=40,m=0;"));
     let placement = "\u{1b}[4;6H\u{1b}[m\u{1b}_Ga=p,q=2,i=2000000000,p=1,x=0,y=0,w=30,h=40,X=0,Y=0,z=-1,C=1\u{1b}\\";
     assert!(output.contains(placement));
     let save_position = output.find("\u{1b}[s").unwrap();
@@ -1384,7 +1432,7 @@ fn kitty_diff_move_remove_free_retransmit() {
     assert!(frame_4.contains("\u{1b}_Ga=d,q=2,d=I,i=2000000000\u{1b}\\"));
     let new_internal = store_test_kitty_image(&parts.0, 30, 40);
     let frame_5 = run_kitty_frame(&parts, vec![kitty_chunk(new_internal, 2, 0, 0)], None);
-    assert!(frame_5.contains("\u{1b}_Ga=t,q=2,f=32,t=d,i=2000000001,"));
+    assert!(frame_5.contains("\u{1b}_Ga=t,q=2,f=32,o=z,t=d,i=2000000001,"));
 }
 
 #[test]
