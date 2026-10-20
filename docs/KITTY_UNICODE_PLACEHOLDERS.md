@@ -1,7 +1,8 @@
 # Kitty Unicode placeholders in this fork
 
-The `kitty-unicode-placeholders` bookmark includes upstream PR #5531 on top of
-the pane-focus fix. It interprets Kitty `U=1` virtual placements and placeholder
+The fork's `main` combines current upstream with the pane-focus fix and
+upstream PR #5531 (also retained on the `kitty-unicode-placeholders` bookmark).
+It interprets Kitty `U=1` virtual placements and placeholder
 cells, then sends ordinary cropped Kitty placements to the outer terminal.
 Applications can therefore compose images as cells: scrolling, overwriting and
 popup occlusion follow the terminal grid instead of leaving a floating image.
@@ -14,8 +15,13 @@ Restart the server after upgrading, since a new client cannot upgrade an existin
 server. Do not manually set the marker on an unpatched server.
 
 Virtual-placement scaling rejects zero cell sizes, overflowing dimensions,
-dimensions outside the variant-cache namespace, and RGBA rasters over 64 MiB
+dimensions above 32767 cells per axis, and RGBA rasters over 64 MiB
 before allocation. Only `U=0` and `U=1` are accepted.
+
+Placeholder rasters use distinct aspect-fit cache keys, so they cannot alias
+ordinary stretched image placements. Host transfers retain upstream's local
+media path and capability-negotiated zlib compression; compressed PNG input
+must not unconditionally become megabytes of uncompressed terminal output.
 
 Regression tests cover Neohelix's separate PNG upload and virtual placement,
 explicit row/column diacritics, offsets, resize, scroll, cell overwrites, deletion
