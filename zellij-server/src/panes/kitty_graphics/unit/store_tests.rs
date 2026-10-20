@@ -1,5 +1,59 @@
 use super::*;
 
+#[test]
+fn compressed_host_payload_round_trips_and_invalidates_scaled_cache() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use flate2::read::ZlibDecoder;
+    use std::io::Read as _;
+
+    let mut store = KittyImageStore::default();
+    let id = store.store_image(rgba_image(1280, 720)).unwrap();
+    let payload = store.base64_for(id, None, true).unwrap();
+    assert!(
+        payload.len() < 32_000,
+        "solid preview must not emit megabytes"
+    );
+    assert_eq!(payload, store.base64_for(id, None, true).unwrap());
+    let decode = |encoded: String| {
+        let compressed = STANDARD.decode(encoded).unwrap();
+        let mut decoded = vec![];
+        ZlibDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        decoded
+    };
+    assert_eq!(decode(payload), store.get(id).unwrap().rgba);
+    let cells = super::ScaledImageKey {
+        source: crate::panes::sixel::PixelRect::new(0, 0, 1280, 720),
+        size: (1040, 980),
+        letterbox: true,
+    };
+    store.add_scaled_variant(id, cells, vec![7; 4096]);
+    assert_eq!(
+        decode(store.base64_for(id, Some(cells), true).unwrap()),
+        vec![7; 4096]
+    );
+    store.add_scaled_variant(id, cells, vec![9; 4096]);
+    assert_eq!(
+        decode(store.base64_for(id, Some(cells), true).unwrap()),
+        vec![9; 4096]
+    );
+    let stretched = super::ScaledImageKey {
+        letterbox: false,
+        ..cells
+    };
+    assert!(store.scaled_variant(id, stretched).is_none());
+    store.add_scaled_variant(id, stretched, vec![3; 4096]);
+    assert_eq!(store.scaled_variant(id, cells).unwrap(), vec![9; 4096]);
+    assert_eq!(
+        STANDARD
+            .decode(store.base64_for(id, Some(stretched), false).unwrap())
+            .unwrap(),
+        vec![3; 4096]
+    );
+}
+
 fn rgba_image(width: u32, height: u32) -> DecodedImage {
     DecodedImage {
         bytes: vec![0; (width * height * 4) as usize],
@@ -101,6 +155,7 @@ fn byte_accounting_matches_hand_computed_total_with_scaled_variants() {
     let first = super::ScaledImageKey {
         source: crate::panes::sixel::PixelRect::new(0, 0, 10, 10),
         size: (3, 2),
+        letterbox: false,
     };
     let second = super::ScaledImageKey {
         size: (5, 4),

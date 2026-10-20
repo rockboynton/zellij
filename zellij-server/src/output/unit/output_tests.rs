@@ -1630,6 +1630,55 @@ fn parse_kitty_placement_crops(output: &str) -> Vec<(usize, usize, usize, usize,
 }
 
 #[test]
+fn kitty_compressed_transmit_round_trips_across_chunks() {
+    use crate::panes::kitty_graphics::parser::KittyCommandParser;
+    use crate::panes::kitty_graphics::store::KittyImageStore;
+
+    // Incompressible pixels exercise the multi-chunk path; a flat preview
+    // exercises the single-chunk path. Both must arrive byte-for-byte intact.
+    for noisy in [false, true] {
+        let mut pixels = vec![0; 128 * 128 * 4];
+        let mut random = 0x12345678u32;
+        if noisy {
+            for byte in &mut pixels {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                *byte = random as u8;
+            }
+        }
+        let mut store = KittyImageStore::default();
+        let id = store
+            .store_image(crate::panes::kitty_graphics::parser::DecodedImage {
+                bytes: pixels.clone(),
+                width: 128,
+                height: 128,
+                format: crate::panes::kitty_graphics::parser::KittyFormat::Rgba32,
+            })
+            .unwrap();
+        let payload = store.base64_for(id, None, true).unwrap();
+        let mut output = String::new();
+        crate::output::emit_kitty_transmit(&mut output, 42, 128, 128, &payload, true).unwrap();
+        assert!(output.contains("f=32,o=z,"));
+        let mut parser = KittyCommandParser::new();
+        let mut decoded = None;
+        let mut chunks = 0;
+        for part in output.split("\u{1b}_G").skip(1) {
+            let raw = part.strip_suffix("\u{1b}\\").unwrap();
+            let (_, chunk) = raw.split_once(';').unwrap();
+            assert!(chunk.len() <= 4096);
+            chunks += 1;
+            if let Some(command) = parser.parse(raw.as_bytes()) {
+                assert!(decoded.is_none());
+                decoded = command.unwrap().image;
+            }
+        }
+        assert_eq!(decoded.unwrap().bytes, pixels);
+        assert_eq!(chunks > 1, noisy);
+    }
+}
+
+#[test]
 fn kitty_transmit_only_once_across_frames() {
     let parts = create_test_kitty_parts();
     let internal = store_test_kitty_image(&parts.0, 30, 40);
@@ -1703,6 +1752,7 @@ fn kitty_local_media_carries_the_scaled_variant_when_the_chunk_names_one() {
             height: 40,
         },
         size: (20, 30),
+        letterbox: false,
     };
     parts
         .0

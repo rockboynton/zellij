@@ -14,6 +14,8 @@ pub type InternalImageId = u64;
 pub struct ScaledImageKey {
     pub source: PixelRect,
     pub size: (usize, usize),
+    /// Aspect-fitted placeholder canvases must not alias stretched placements.
+    pub letterbox: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

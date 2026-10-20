@@ -212,6 +212,7 @@ fn build_environment_block(terminal_id: u32, pane_env: &PaneEnv) -> Vec<u16> {
             variables.insert(key.clone(), value.clone());
         }
     }
+    variables.retain(|key, _| !key.eq_ignore_ascii_case("ZELLIJ_KITTY_UNICODE_PLACEHOLDERS"));
     let mut block: Vec<u16> = Vec::new();
     for (key, value) in variables {
         let entry = format!("{}={}", key, value);
@@ -220,6 +221,8 @@ fn build_environment_block(terminal_id: u32, pane_env: &PaneEnv) -> Vec<u16> {
     }
     let pane_entry = format!("ZELLIJ_PANE_ID={}", terminal_id);
     block.extend(OsStr::new(&pane_entry).encode_wide());
+    block.push(0);
+    block.extend(OsStr::new("ZELLIJ_KITTY_UNICODE_PLACEHOLDERS=1").encode_wide());
     block.push(0);
     block.push(0); // double-null terminator
     block
