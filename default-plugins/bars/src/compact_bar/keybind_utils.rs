@@ -407,6 +407,7 @@ impl KeybindProcessor {
                     |action: &Action| matches!(action, Action::ToggleFocusFullscreen),
                     |action: &Action| matches!(action, Action::ToggleFloatingPanes),
                     |action: &Action| matches!(action, Action::TogglePaneEmbedOrFloating),
+                    |action: &Action| matches!(action, Action::ToggleBars { .. }),
                     |action: &Action| {
                         matches!(
                             action,
@@ -418,6 +419,7 @@ impl KeybindProcessor {
                             }
                         )
                     },
+                    |action: &Action| matches!(action, Action::ToggleStackListOrientation),
                     |action: &Action| {
                         matches!(
                             action,
@@ -693,7 +695,16 @@ impl KeybindProcessor {
             },
             InputMode::Session => {
                 let ordered_predicates = vec![
+                    |action: &Action| matches!(action, Action::ToggleSessionCard),
                     |action: &Action| matches!(action, Action::Detach),
+                    |action: &Action| {
+                        matches!(
+                            action,
+                            Action::SwitchToMode {
+                                input_mode: InputMode::RenameSession
+                            }
+                        )
+                    },
                     |action: &Action| action.launches_plugin("session-manager"),
                     |action: &Action| action.launches_plugin("plugin-manager"),
                     |action: &Action| action.launches_plugin("configuration"),
@@ -704,6 +715,7 @@ impl KeybindProcessor {
             InputMode::EnterSearch
             | InputMode::RenameTab
             | InputMode::RenamePane
+            | InputMode::RenameSession
             | InputMode::Prompt
             | InputMode::Tmux => Vec::new(),
         }

@@ -22,7 +22,7 @@ use zellij_utils::structured_render::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(20);
-const COMMON_MENU_MARKER: &str = "Session manager";
+const COMMON_MENU_MARKER: &str = "Settings…";
 
 struct WindowClient {
     sender: IpcSenderWithContext<ClientToServerMsg>,
@@ -47,12 +47,16 @@ impl WindowClient {
             BTreeMap::new(),
             None,
             None,
+            None,
         );
         sender
             .send_client_msg(handshake.message)
             .expect("failed to send the attach message");
         sender
-            .send_client_msg(ClientToServerMsg::StructuredRenderSupport { supported: true })
+            .send_client_msg(ClientToServerMsg::StructuredRenderSupport {
+                supported: true,
+                row_shifts: false,
+            })
             .expect("failed to declare structured rendering");
 
         let (messages_tx, messages) = mpsc::channel();

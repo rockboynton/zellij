@@ -9,12 +9,13 @@ use std::{fs, path::PathBuf};
 use crate::os_input_output::ClientOsApi;
 use uuid::Uuid;
 use zellij_utils::{
-    cli::{PromptCli, PromptElementCli, SubscribeCli, SubscribeFormat},
-    data::{PaneId, PipePopupPlacement},
+    cli::{EventsCli, PromptCli, PromptElementCli, SubscribeCli, SubscribeFormat},
+    data::{OutsideClick, PaneId, PipePopupPlacement},
     errors::prelude::*,
     input::actions::Action,
-    ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
+    ipc::{ClientToServerMsg, ExitReason, IpcReceiveError, ServerToClientMsg},
     prompt::{self, ChoiceItem, PromptElement},
+    session_events::CliEventFilter,
 };
 
 pub fn start_cli_client(
@@ -30,7 +31,10 @@ pub fn start_cli_client(
             .unwrap_or_else(|| sock_dir.join(session_name))
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    os_input.connect_to_server(&*zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_running_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", crate::connect_error_message(e));
+        process::exit(1);
+    }
     let pane_id = os_input
         .env_variable("ZELLIJ_PANE_ID")
         .and_then(|e| e.trim().parse().ok());
@@ -52,6 +56,8 @@ pub fn start_cli_client(
                 pane_title,
                 popup,
                 popup_no_focus,
+                popup_capture_all_keys,
+                popup_outside_click,
             } => {
                 let exit_status = pipe_client(
                     &mut os_input,
@@ -70,6 +76,8 @@ pub fn start_cli_client(
                         pane_title,
                         popup,
                         popup_no_focus,
+                        popup_capture_all_keys,
+                        popup_outside_click,
                     },
                     payload,
                 );
@@ -106,6 +114,8 @@ struct PipeRequest {
     pane_title: Option<String>,
     popup: Option<PipePopupPlacement>,
     popup_no_focus: bool,
+    popup_capture_all_keys: bool,
+    popup_outside_click: Option<OutsideClick>,
 }
 
 impl PipeRequest {
@@ -139,6 +149,8 @@ impl PipeRequest {
                 pane_title: self.pane_title.clone(),
                 popup: self.popup,
                 popup_no_focus: self.popup_no_focus,
+                popup_capture_all_keys: self.popup_capture_all_keys,
+                popup_outside_click: self.popup_outside_click,
             },
             terminal_id: self.pane_id,
             client_id: None,
@@ -421,7 +433,10 @@ pub fn start_prompt_client(
             .unwrap_or_else(|| sock_dir.join(session_name))
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    os_input.connect_to_server(&*zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_running_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", crate::connect_error_message(e));
+        process::exit(1);
+    }
     let request = PipeRequest {
         pipe_id: Uuid::new_v4().to_string(),
         name: Some(plan.element.name().to_owned()),
@@ -437,6 +452,8 @@ pub fn start_prompt_client(
         pane_title: Some(format!("prompt: {}", plan.element.name())),
         popup: Some(prompt_cli.placement()),
         popup_no_focus: !prompt_cli.takes_focus(),
+        popup_capture_all_keys: prompt_cli.answer_args().capture_all_keys,
+        popup_outside_click: prompt_cli.answer_args().outside_click,
     }
     .prepare();
     let exit_status = match plan.input {
@@ -754,19 +771,22 @@ fn individual_messages_client(
     };
     os_input.send_to_server(msg);
     loop {
-        match os_input.recv_from_server() {
-            Some((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
+        match os_input
+            .try_recv_from_server()
+            .map_err(|e| matches!(e, IpcReceiveError::Disconnected))
+        {
+            Ok((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
                 return None;
             },
-            Some((ServerToClientMsg::Log { lines: log_lines }, _)) => {
+            Ok((ServerToClientMsg::Log { lines: log_lines }, _)) => {
                 log_lines.iter().for_each(|line| println!("{line}"));
                 return None;
             },
-            Some((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
+            Ok((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
                 log_lines.iter().for_each(|line| eprintln!("{line}"));
                 return Some(2);
             },
-            Some((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
+            Ok((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
                 ExitReason::Error(e) => {
                     eprintln!("{}", e);
                     return Some(2);
@@ -777,6 +797,10 @@ fn individual_messages_client(
                 _ => {
                     return None;
                 },
+            },
+            Err(true) => {
+                eprintln!("The session closed the connection before the action finished.");
+                return Some(2);
             },
             _ => {},
         }
@@ -796,7 +820,10 @@ pub fn start_subscribe_client(
             .unwrap_or_else(|| sock_dir.join(session_name))
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    os_input.connect_to_server(&*zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_running_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", crate::connect_error_message(e));
+        process::exit(1);
+    }
 
     // Parse pane IDs
     let pane_ids: Vec<PaneId> = subscribe_cli
@@ -872,6 +899,68 @@ pub fn start_subscribe_client(
                     },
                 }
                 if remaining_panes.is_empty() {
+                    break;
+                }
+            },
+            Some((ServerToClientMsg::Exit { .. }, _)) => break,
+            Some((ServerToClientMsg::LogError { lines }, _)) => {
+                for line in lines {
+                    eprintln!("{}", line);
+                }
+                process::exit(2);
+            },
+            None => break,
+            _ => {},
+        }
+    }
+
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+}
+
+pub fn start_events_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    events_cli: EventsCli,
+) {
+    let pane_ids: Vec<PaneId> = events_cli
+        .pane_id
+        .iter()
+        .map(|s| {
+            PaneId::from_str(s).unwrap_or_else(|e| {
+                eprintln!("Invalid pane ID '{}': {}", s, e);
+                process::exit(2);
+            })
+        })
+        .collect();
+
+    let zellij_ipc_pipe: PathBuf = {
+        let sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+        fs::create_dir_all(&sock_dir).unwrap();
+        zellij_utils::shared::set_permissions(&sock_dir, 0o700).unwrap();
+        zellij_utils::sessions::resolve_session_socket_path(session_name)
+            .unwrap_or_else(|| sock_dir.join(session_name))
+    };
+    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", crate::connect_error_message(e));
+        process::exit(1);
+    }
+
+    os_input.send_to_server(ClientToServerMsg::SubscribeToEvents {
+        filter: CliEventFilter {
+            event_types: events_cli.event_types,
+            pane_ids,
+            tab_ids: events_cli.tab_id,
+            initial_state: !events_cli.no_initial_state,
+        },
+    });
+
+    let mut stdout = os_input.get_stdout_writer();
+
+    loop {
+        match os_input.recv_from_server() {
+            Some((ServerToClientMsg::SessionEvent { json }, _)) => {
+                if writeln!(stdout, "{}", json).is_err() || stdout.flush().is_err() {
                     break;
                 }
             },

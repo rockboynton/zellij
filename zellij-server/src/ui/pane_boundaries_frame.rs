@@ -81,6 +81,32 @@ pub struct StackListEntry {
     pub is_selected: bool,
     pub is_emphasized: bool,
     pub stack_is_focused: bool,
+    pub is_in_row: bool,
+}
+
+impl StackListEntry {
+    const SELECTION_MARKER: &'static str = "> ";
+    const CORNER_PADDING: usize = 1;
+    pub const OVERHEAD: usize = Self::SELECTION_MARKER.len() + 2 * (1 + Self::CORNER_PADDING);
+    pub const ROW_PADDING: usize = 1;
+    pub const ROW_OVERHEAD: usize = 2 * Self::ROW_PADDING;
+}
+
+pub fn stack_list_row_filler(
+    text: &str,
+    style: &Style,
+    stack_is_focused: bool,
+) -> Vec<TerminalCharacter> {
+    let color = style.colors.frame_unselected.map(|frame| frame.base);
+    if stack_is_focused {
+        styled_characters(text, |styles| {
+            if let Some(palette_color) = color {
+                styles.foreground = Some(AnsiCode::from(palette_color));
+            }
+        })
+    } else {
+        dimmed_foreground_color(text, color)
+    }
 }
 
 pub struct FrameParams {
@@ -145,6 +171,14 @@ pub struct PaneFrame {
     mouse_hover_tips: bool,
     dimmed: bool,
     guest_choice_indicator: Option<GuestChoiceIndicator>,
+    attention_marker: Option<FrameAttentionMarker>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameAttentionMarker {
+    pub text: String,
+    pub color: Option<PaletteColor>,
+    pub dim: bool,
 }
 
 impl PaneFrame {
@@ -186,7 +220,14 @@ impl PaneFrame {
             mouse_hover_tips: frame_params.mouse_hover_tips,
             dimmed: frame_params.dimmed,
             guest_choice_indicator: frame_params.guest_choice_indicator,
+            attention_marker: None,
         }
+    }
+    pub fn omits_title(&self) -> bool {
+        self.omit_title
+    }
+    pub fn set_attention_marker(&mut self, marker: Option<FrameAttentionMarker>) {
+        self.attention_marker = marker;
     }
     pub fn is_pinned(mut self, is_pinned: bool) -> Self {
         self.is_pinned = is_pinned;
@@ -520,10 +561,33 @@ impl PaneFrame {
         }
     }
     fn render_title_left_side(&self, max_length: usize) -> Option<(Vec<TerminalCharacter>, usize)> {
+        let Some(marker) = self.attention_marker.as_ref() else {
+            return self.render_text_left_side(&self.title, max_length);
+        };
+        if max_length <= 6 || self.title.is_empty() {
+            return self.render_text_left_side(&self.title, max_length);
+        }
+        let marker_text = format!("{} ", marker.text);
+        let marker_width = marker_text.width();
+        let (mut title_chars, title_width) =
+            self.render_text_left_side(&self.title, max_length.saturating_sub(marker_width))?;
+        let marker_chars = if marker.dim {
+            dimmed_foreground_color(&marker_text, marker.color)
+        } else {
+            foreground_color(&marker_text, marker.color)
+        };
+        title_chars.extend(marker_chars);
+        Some((title_chars, title_width + marker_width))
+    }
+    fn render_text_left_side(
+        &self,
+        title: &str,
+        max_length: usize,
+    ) -> Option<(Vec<TerminalCharacter>, usize)> {
         let middle_truncated_sign = "[..]";
         let middle_truncated_sign_long = "[...]";
-        let full_text = format!(" {} ", &self.title);
-        if max_length <= 6 || self.title.is_empty() {
+        let full_text = format!(" {} ", title);
+        if max_length <= 6 || title.is_empty() {
             None
         } else if graphemes::display_width(&full_text) <= max_length {
             Some((
@@ -797,12 +861,67 @@ impl PaneFrame {
             .or_else(|| Some(self.title_line_without_middle()))
             .with_context(|| format!("failed to render title '{}'", self.title))
     }
-    fn render_stack_list_entry(&self, entry: &StackListEntry) -> Vec<TerminalCharacter> {
+    fn render_stack_list_row_entry(&self, entry: &StackListEntry) -> Vec<TerminalCharacter> {
         let usable_cols = self.geom.cols;
-        let selection_marker = "> ";
+        let padding = if usable_cols >= StackListEntry::ROW_OVERHEAD + 1 {
+            StackListEntry::ROW_PADDING
+        } else {
+            0
+        };
+        let label_cols = usable_cols - 2 * padding;
+        let content = graphemes::truncate_end(&entry.label, label_cols, "…").into_owned();
+        let unfocused_color = self.style.colors.frame_unselected.map(|frame| frame.base);
+        let (color, bold) = if entry.is_selected || entry.is_emphasized {
+            (self.color, true)
+        } else {
+            (unfocused_color, entry.stack_is_focused)
+        };
+        let mut label = styled_characters(&content, |styles| {
+            if bold {
+                styles.bold = Some(AnsiCode::On);
+            } else {
+                styles.dim = Some(AnsiCode::On);
+            }
+            if entry.is_selected {
+                styles.underline = Some(AnsiCode::Underline(None));
+            }
+            if let Some(palette_color) = color {
+                styles.foreground = Some(AnsiCode::from(palette_color));
+            }
+        });
+        let mut line = Vec::with_capacity(usable_cols);
+        line.extend(std::iter::repeat(EMPTY_TERMINAL_CHARACTER).take(padding));
+        line.append(&mut label);
+        let filled = padding + graphemes::display_width(&content);
+        line.extend(
+            std::iter::repeat(EMPTY_TERMINAL_CHARACTER).take(usable_cols.saturating_sub(filled)),
+        );
+        line
+    }
+    fn render_stack_list_entry(&self, entry: &StackListEntry) -> Vec<TerminalCharacter> {
+        if entry.is_in_row {
+            return self.render_stack_list_row_entry(entry);
+        }
+        let usable_cols = self.geom.cols;
+        if usable_cols < StackListEntry::OVERHEAD {
+            let marker = if entry.is_selected && usable_cols > 0 {
+                ">"
+            } else {
+                ""
+            };
+            let label = graphemes::truncate_end(&entry.label, usable_cols - marker.len(), "…");
+            let text = format!("{}{}", marker, label);
+            let mut line = foreground_color(&text, self.color);
+            line.extend(
+                std::iter::repeat(EMPTY_TERMINAL_CHARACTER)
+                    .take(usable_cols - graphemes::display_width(&text)),
+            );
+            return line;
+        }
+        let selection_marker = StackListEntry::SELECTION_MARKER;
         let marker_width = selection_marker.width();
-        let corner_padding = 1;
-        let corner_overhead = 2 * (1 + corner_padding);
+        let corner_padding = StackListEntry::CORNER_PADDING;
+        let corner_overhead = StackListEntry::OVERHEAD - marker_width;
         let inner_width = entry
             .width
             .min(usable_cols.saturating_sub(marker_width + corner_overhead));
@@ -922,8 +1041,28 @@ impl PaneFrame {
             .then(|| self.first_exited_held_title_part_full());
         let exit_length = exit_part.as_ref().map(|(_, length)| *length).unwrap_or(0);
         let content_max_length = max_length.saturating_sub(title_padding + exit_length);
+        let marker_part = self.attention_marker.as_ref().and_then(|marker| {
+            if content_max_length < graphemes::display_width(&marker.text) + 4 {
+                return None;
+            }
+            let text = marker.text.clone();
+            let mut characters = if marker.dim {
+                dimmed_foreground_color(&text, marker.color)
+            } else {
+                foreground_color(&text, marker.color)
+            };
+            characters.append(&mut foreground_color(" ", self.color));
+            let width = graphemes::display_width(&text) + 1;
+            Some((characters, width))
+        });
+        let marker_length = marker_part.as_ref().map(|(_, length)| *length).unwrap_or(0);
+        let content_max_length = content_max_length.saturating_sub(marker_length);
         let content = graphemes::truncate_end(&self.title, content_max_length, "…").into_owned();
         let (mut part, mut length) = self.plain_title_part(&content);
+        if let Some((mut marker, marker_length)) = marker_part {
+            part.append(&mut marker);
+            length += marker_length;
+        }
         if let Some((mut exit, exit_length)) = exit_part {
             part.append(&mut exit);
             length += exit_length;
@@ -1600,6 +1739,7 @@ mod tests {
                 is_selected: true,
                 is_emphasized: false,
                 stack_is_focused: true,
+                is_in_row: false,
             });
             let cells = frame.render_stack_list_entry(frame.stack_list_entry.as_ref().unwrap());
             let width: usize = cells.iter().map(|c| c.width()).sum();
@@ -1611,6 +1751,88 @@ mod tests {
                 characters_to_string(&cells)
             );
             assert_cells_are_whole_clusters(&cells, CLUSTER_TITLE);
+        }
+    }
+
+    #[test]
+    fn stack_list_entries_fit_the_allocated_width() {
+        for label in ["", "foo", "terminal", "界", CLUSTER_TITLE] {
+            let label_width = graphemes::display_width(label);
+            let natural_width = label_width + StackListEntry::OVERHEAD;
+            for selected in [false, true] {
+                for cols in 0..=natural_width {
+                    let frame = title_frame(label, cols, true);
+                    let entry = StackListEntry {
+                        width: label_width,
+                        label: label.to_owned(),
+                        is_selected: selected,
+                        is_emphasized: false,
+                        stack_is_focused: true,
+                        is_in_row: false,
+                    };
+                    let cells = frame.render_stack_list_entry(&entry);
+                    assert_eq!(cells.iter().map(|cell| cell.width()).sum::<usize>(), cols);
+                    assert_cells_are_whole_clusters(&cells, label);
+                    if cols == natural_width {
+                        assert!(characters_to_string(&cells).contains(label));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stack_list_row_entries_fit_the_allocated_width() {
+        for label in ["", "foo", "terminal", "界", CLUSTER_TITLE] {
+            let label_width = graphemes::display_width(label);
+            let natural_width = label_width + StackListEntry::ROW_OVERHEAD;
+            for selected in [false, true] {
+                for cols in 0..=natural_width {
+                    let frame = title_frame(label, cols, true);
+                    let entry = StackListEntry {
+                        width: label_width,
+                        label: label.to_owned(),
+                        is_selected: selected,
+                        is_emphasized: false,
+                        stack_is_focused: true,
+                        is_in_row: true,
+                    };
+                    let cells = frame.render_stack_list_entry(&entry);
+                    assert_eq!(cells.iter().map(|cell| cell.width()).sum::<usize>(), cols);
+                    assert_cells_are_whole_clusters(&cells, label);
+                    let text = characters_to_string(&cells);
+                    assert!(!text.contains('>') && !text.contains('│'), "{:?}", text);
+                    if cols == natural_width {
+                        assert_eq!(text, format!(" {} ", label));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_selected_stack_list_row_entry_is_underlined() {
+        for selected in [false, true] {
+            let frame = title_frame("vim", 5, true);
+            let entry = StackListEntry {
+                width: 3,
+                label: "vim".to_owned(),
+                is_selected: selected,
+                is_emphasized: false,
+                stack_is_focused: true,
+                is_in_row: true,
+            };
+            let cells = frame.render_stack_list_entry(&entry);
+            let underlined: Vec<bool> = cells
+                .iter()
+                .map(|cell| cell.styles.underline == Some(AnsiCode::Underline(None)))
+                .collect();
+            assert_eq!(
+                underlined,
+                vec![false, selected, selected, selected, false],
+                "selected={}",
+                selected
+            );
         }
     }
 

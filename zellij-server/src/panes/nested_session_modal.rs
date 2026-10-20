@@ -229,6 +229,7 @@ pub fn guest_modal_chunks(
     style: &Style,
     session_name: &str,
     selected: usize,
+    hovered: Option<usize>,
     shortcuts: &GuestModalShortcuts,
 ) -> Vec<CharacterChunk> {
     if rows < 1 || columns < 1 {
@@ -247,7 +248,15 @@ pub fn guest_modal_chunks(
         ));
     }
 
-    let layout = guest_modal_layout(columns, rows, &styles, session_name, selected, shortcuts);
+    let layout = guest_modal_layout(
+        columns,
+        rows,
+        &styles,
+        session_name,
+        selected,
+        hovered,
+        shortcuts,
+    );
     for (offset, row) in layout.rows.iter().enumerate() {
         let current_row = layout.start_row + offset;
         if current_row >= rows {
@@ -347,7 +356,7 @@ struct GuestModalRow {
 struct GuestModalLayout {
     rows: Vec<GuestModalRow>,
     block_width: usize,
-    option_rows: Vec<usize>,
+    option_row_ranges: Vec<std::ops::Range<usize>>,
     left_pad: usize,
     start_row: usize,
 }
@@ -373,7 +382,7 @@ fn guest_modal_fallback_layout(
             block_fill: styles.fill.clone(),
         }],
         block_width,
-        option_rows: vec![],
+        option_row_ranges: vec![],
         left_pad,
         start_row: rows / 2,
     }
@@ -385,6 +394,7 @@ fn guest_modal_layout(
     styles: &GuestModalStyles,
     session_name: &str,
     selected: usize,
+    hovered: Option<usize>,
     shortcuts: &GuestModalShortcuts,
 ) -> GuestModalLayout {
     if columns < 20 {
@@ -431,7 +441,7 @@ fn guest_modal_layout(
     let block_width = block_width.min(columns);
 
     let mut rows_content: Vec<GuestModalRow> = Vec::new();
-    let mut option_rows: Vec<usize> = Vec::new();
+    let mut option_row_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     rows_content.push(GuestModalRow {
         segments: title,
         block_fill: styles.fill.clone(),
@@ -468,8 +478,13 @@ fn guest_modal_layout(
                 styles.fill.clone(),
             )
         };
+        let title_styles = if hovered == Some(index) {
+            (*title_styles).italic(Some(AnsiCode::On)).into()
+        } else {
+            title_styles
+        };
         let marker = if is_selected { "> " } else { "  " };
-        option_rows.push(rows_content.len());
+        let option_start = rows_content.len();
         rows_content.push(GuestModalRow {
             segments: vec![
                 (format!("{}{}", marker, number), marker_styles),
@@ -489,6 +504,7 @@ fn guest_modal_layout(
                 block_fill: block_fill.clone(),
             });
         }
+        option_row_ranges.push(option_start..rows_content.len());
     }
     rows_content.push(GuestModalRow {
         segments: Vec::new(),
@@ -509,16 +525,18 @@ fn guest_modal_layout(
     GuestModalLayout {
         rows: rows_content,
         block_width,
-        option_rows,
+        option_row_ranges,
         left_pad,
         start_row,
     }
 }
 
-pub fn guest_modal_option_at_content_row(
+#[allow(clippy::too_many_arguments)]
+pub fn guest_modal_option_at_content_position(
     rows: usize,
     columns: usize,
     row: usize,
+    column: usize,
     style: &Style,
     session_name: &str,
     selected: usize,
@@ -528,14 +546,23 @@ pub fn guest_modal_option_at_content_row(
         return None;
     }
     let styles = guest_modal_styles(style);
-    let layout = guest_modal_layout(columns, rows, &styles, session_name, selected, shortcuts);
-    if layout.option_rows.is_empty() {
+    let layout = guest_modal_layout(
+        columns,
+        rows,
+        &styles,
+        session_name,
+        selected,
+        None,
+        shortcuts,
+    );
+    if column < layout.left_pad || column >= layout.left_pad + layout.block_width {
         return None;
     }
+    let row_in_block = row.checked_sub(layout.start_row)?;
     layout
-        .option_rows
+        .option_row_ranges
         .iter()
-        .position(|&option_row| layout.start_row + option_row == row)
+        .position(|range| range.contains(&row_in_block))
 }
 
 fn center_modal_pad(block_width: usize, columns: usize) -> usize {

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use zellij_tile::graphemes;
 use zellij_tile::prelude::*;
@@ -108,6 +109,8 @@ pub enum Effect {
     ResetMousebinds(Vec<(InputMode, MouseTrigger)>),
     SwitchMode(InputMode),
     Refresh,
+    /// Ask the plugin with this id to open its own settings.
+    OpenPluginSettings(u32),
 }
 
 pub fn run_effects(effects: Vec<Effect>) -> bool {
@@ -136,6 +139,14 @@ pub fn run_effects(effects: Vec<Effect>) -> bool {
             },
             Effect::SwitchMode(mode) => switch_to_input_mode(&mode),
             Effect::Refresh => changed_config = true,
+            Effect::OpenPluginSettings(plugin_id) => pipe_message_to_plugin(
+                MessageToPlugin::new(OPEN_PLUGIN_SETTINGS_MESSAGE)
+                    .with_destination_plugin_id(plugin_id)
+                    .with_args(BTreeMap::from([(
+                        OPEN_PLUGIN_SETTINGS_CLIENT_ID_ARG.to_owned(),
+                        get_plugin_ids().client_id.to_string(),
+                    )])),
+            ),
         }
     }
     changed_config
@@ -187,6 +198,10 @@ pub fn is_plain(key: &KeyWithModifier, bare_key: BareKey) -> bool {
     key.bare_key == bare_key && key.has_no_modifiers()
 }
 
+pub fn is_delete_key(key: &KeyWithModifier) -> bool {
+    is_plain(key, BareKey::Delete) || is_plain(key, BareKey::Backspace)
+}
+
 pub fn is_move_key(key: &KeyWithModifier, bare_key: BareKey) -> bool {
     key.bare_key == bare_key
         && (key.has_modifiers(&[KeyModifier::Alt]) || key.has_modifiers(&[KeyModifier::Shift]))
@@ -230,7 +245,7 @@ pub fn short_action_text(text: &str) -> String {
 }
 
 pub fn mode_label(value: &str) -> Option<&'static str> {
-    const LABELS: [&str; 13] = [
+    const LABELS: [&str; 14] = [
         "Normal",
         "Locked",
         "Pane",
@@ -242,6 +257,7 @@ pub fn mode_label(value: &str) -> Option<&'static str> {
         "EnterSearch",
         "RenameTab",
         "RenamePane",
+        "RenameSession",
         "Session",
         "Tmux",
     ];

@@ -11,22 +11,23 @@ mod swap_layouts;
 use crate::plugins::PluginId;
 use copy_command::CopyCommand;
 pub use mouse_handler::{ContextMenuRequest, MouseEffect, MouseHandler, PaneEdge, PaneResizeState};
-pub use popup::{place_popup, PopupKind, PopupMouseOutcome, PopupPlacement, POPUP_Z_INDEX};
+pub use popup::{place_popup, PopupBehavior, PopupMouseOutcome, PopupPlacement, POPUP_Z_INDEX};
 use std::env::temp_dir;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use uuid::Uuid;
 use zellij_utils::data::PaneContents;
 use zellij_utils::data::{
-    BorderStyle, BorderStyleOverride, Direction, KeyModifier, KeyWithModifier, NewPanePlacement,
-    PaneInfo, PermissionStatus, PermissionType, PluginPermission, RegexHighlight, ResizeStrategy,
-    Style, StyledText, WebSharing,
+    bar_role_label, bar_shows_mode, BareKey, BorderStyle, BorderStyleOverride, Direction,
+    HiddenBars, KeyModifier, KeyWithModifier, NewPanePlacement, PaneInfo, PermissionStatus,
+    PermissionType, PluginPermission, RegexHighlight, ResizeStrategy, Style, StyledText,
+    WebSharing,
 };
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::input::mousebinds::Mousebinds;
-use zellij_utils::input::options::DEFAULT_WORD_SEPARATORS;
+use zellij_utils::input::options::{StackListOrientation, DEFAULT_WORD_SEPARATORS};
 use zellij_utils::position::Position;
 use zellij_utils::position::{Column, Line};
 use zellij_utils::shared::clean_string_from_control_and_linebreak;
@@ -36,13 +37,14 @@ use zellij_utils::structured_render::{
 
 use crate::background_jobs::BackgroundJob;
 use crate::pane_groups::PaneGroups;
+use crate::panes::CoveredPanes;
 use crate::pty_writer::PtyWriteInstruction;
 use crate::screen::{CopyOptions, GuestModalOutcome, ScreenInstruction, TypedInput};
-use crate::ui::hint_text::{
-    held_hint_variants, hover_hint_variants, resize_hint_variants, HintExitStatus,
-};
+use crate::ui::hint_text::{held_hint_variants, HintExitStatus};
 use crate::ui::{
-    loading_indication::LoadingIndication, pane_boundaries_frame::FrameParams,
+    boundaries::boundary_type,
+    loading_indication::LoadingIndication,
+    pane_boundaries_frame::{stack_list_row_filler, FrameParams, StackListEntry},
     pane_contents_and_ui::PaneContentsAndUi,
 };
 use layout_applier::LayoutApplier;
@@ -59,7 +61,9 @@ use crate::{
     panes::nested_session_modal::GuestModalShortcuts,
     panes::sixel::SixelImageStore,
     panes::{FloatingPanes, TiledPanes},
-    panes::{LinkHandler, PaneId, PluginPane, TerminalPane, EMPTY_TERMINAL_CHARACTER},
+    panes::{
+        LinkHandler, PaneId, PluginPane, TerminalCharacter, TerminalPane, EMPTY_TERMINAL_CHARACTER,
+    },
     plugins::PluginInstruction,
     pty::{ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
     thread_bus::ThreadSenders,
@@ -96,8 +100,8 @@ macro_rules! resize_pty {
                 $senders
                     .send_to_pty_writer(PtyWriteInstruction::ResizePty(
                         *pid,
-                        $pane.get_content_columns() as u16,
-                        $pane.get_content_rows() as u16,
+                        $pane.program_columns() as u16,
+                        $pane.program_rows() as u16,
                         None,
                         None,
                     ))
@@ -120,10 +124,8 @@ macro_rules! resize_pty {
             let character_cell_size = $character_cell_size.borrow();
             match *character_cell_size {
                 Some(size_in_pixels) => {
-                    let width_in_pixels =
-                        (size_in_pixels.width * $pane.get_content_columns()) as u16;
-                    let height_in_pixels =
-                        (size_in_pixels.height * $pane.get_content_rows()) as u16;
+                    let width_in_pixels = (size_in_pixels.width * $pane.program_columns()) as u16;
+                    let height_in_pixels = (size_in_pixels.height * $pane.program_rows()) as u16;
                     (Some(width_in_pixels), Some(height_in_pixels))
                 },
                 None => (None, None),
@@ -136,8 +138,8 @@ macro_rules! resize_pty {
                 $senders
                     .send_to_pty_writer(PtyWriteInstruction::ResizePty(
                         *pid,
-                        $pane.get_content_columns() as u16,
-                        $pane.get_content_rows() as u16,
+                        $pane.program_columns() as u16,
+                        $pane.program_rows() as u16,
                         width_in_pixels,
                         height_in_pixels,
                     ))
@@ -237,6 +239,176 @@ pub type StackListId = usize;
 pub struct StackList {
     pub members: Vec<PaneId>,
     pub visible: PaneId,
+    pub orientation: StackListOrientation,
+}
+
+struct StackListEntryLayout {
+    member: PaneId,
+    x: usize,
+    label_width: usize,
+    width: usize,
+}
+
+struct StackListRowLayout {
+    entries: Vec<StackListEntryLayout>,
+    hidden_before: usize,
+    hidden_after: usize,
+}
+
+fn stack_list_row_overflow_marker(hidden: usize, before: bool) -> String {
+    match (hidden, before) {
+        (0, _) => String::new(),
+        (hidden, true) => format!("‹{} ", hidden),
+        (hidden, false) => format!(" {}›", hidden),
+    }
+}
+
+fn stack_list_row_overflow_width(hidden: usize) -> usize {
+    stack_list_row_overflow_marker(hidden, true).chars().count()
+}
+
+fn layout_stack_list_row(
+    members: &[(PaneId, usize)],
+    selected: usize,
+    cols: usize,
+) -> StackListRowLayout {
+    let empty = StackListRowLayout {
+        entries: vec![],
+        hidden_before: 0,
+        hidden_after: 0,
+    };
+    if members.is_empty() || cols == 0 {
+        return empty;
+    }
+    let natural_width = |label_width: usize| label_width + StackListEntry::ROW_OVERHEAD;
+    let total_width: usize = members
+        .iter()
+        .map(|(_, label_width)| natural_width(*label_width))
+        .sum::<usize>()
+        + members.len()
+        - 1;
+    if total_width <= cols {
+        let mut x = (cols - total_width) / 2;
+        let entries = members
+            .iter()
+            .map(|(member, label_width)| {
+                let width = natural_width(*label_width);
+                let entry = StackListEntryLayout {
+                    member: *member,
+                    x,
+                    label_width: *label_width,
+                    width,
+                };
+                x += width + 1;
+                entry
+            })
+            .collect();
+        return StackListRowLayout { entries, ..empty };
+    }
+    let count = members.len();
+    let selected = selected.min(count - 1);
+    let widths: Vec<usize> = members
+        .iter()
+        .map(|(_, label_width)| natural_width(*label_width))
+        .collect();
+    let before_marker = stack_list_row_overflow_width(selected);
+    let after_marker = stack_list_row_overflow_width(count - 1 - selected);
+    let selected_room = cols.saturating_sub(before_marker + after_marker);
+    if widths[selected] > selected_room {
+        let (member, label_width) = members[selected];
+        let (x, width) = if selected_room == 0 {
+            (0, cols)
+        } else {
+            (before_marker, selected_room)
+        };
+        return StackListRowLayout {
+            entries: vec![StackListEntryLayout {
+                member,
+                x,
+                label_width,
+                width,
+            }],
+            hidden_before: selected,
+            hidden_after: count - 1 - selected,
+        };
+    }
+    let fit = |indices: &mut dyn Iterator<Item = usize>, budget: usize| -> (usize, usize) {
+        let mut used = 0;
+        let mut shown = 0;
+        for index in indices {
+            let needed = widths[index] + 1;
+            if used + needed > budget {
+                break;
+            }
+            used += needed;
+            shown += 1;
+        }
+        (shown, used)
+    };
+    let fill_left = |budget: usize| -> (usize, usize) {
+        let (shown, used) = fit(&mut (0..selected).rev(), budget);
+        if shown < selected {
+            fit(
+                &mut (0..selected).rev(),
+                budget.saturating_sub(before_marker),
+            )
+        } else {
+            (shown, used)
+        }
+    };
+    let fill_right = |budget: usize| -> (usize, usize) {
+        let after_count = count - 1 - selected;
+        let (shown, used) = fit(&mut (selected + 1..count), budget);
+        if shown < after_count {
+            fit(
+                &mut (selected + 1..count),
+                budget.saturating_sub(after_marker),
+            )
+        } else {
+            (shown, used)
+        }
+    };
+    let left_half = (cols - widths[selected]) / 2;
+    let right_half = cols - widths[selected] - left_half;
+    let (mut shown_left, used_left) = fill_left(left_half);
+    let (mut shown_right, used_right) = fill_right(right_half);
+    let mut selected_x = left_half;
+    if shown_left == selected && shown_right < count - 1 - selected {
+        let slack = left_half - used_left;
+        (shown_right, _) = fill_right(right_half + slack);
+        selected_x = used_left;
+    } else if shown_right == count - 1 - selected && shown_left < selected {
+        let slack = right_half - used_right;
+        (shown_left, _) = fill_left(left_half + slack);
+        selected_x = cols - widths[selected] - used_right;
+    }
+    let first = selected - shown_left;
+    let last = selected + shown_right;
+    let mut x = selected_x;
+    let mut entries = vec![];
+    for index in (first..selected).rev() {
+        x -= widths[index] + 1;
+        entries.push((index, x));
+    }
+    entries.reverse();
+    let mut x = selected_x;
+    for index in selected..=last {
+        entries.push((index, x));
+        x += widths[index] + 1;
+    }
+    StackListRowLayout {
+        entries: entries
+            .into_iter()
+            .map(|(index, x)| StackListEntryLayout {
+                member: members[index].0,
+                x,
+                label_width: members[index].1,
+                width: widths[index],
+            })
+            .collect(),
+        hidden_before: first,
+        hidden_after: count - 1 - last,
+    }
 }
 
 impl StackList {
@@ -272,6 +444,9 @@ pub(crate) struct Tab {
     stack_lists: HashMap<StackListId, StackList>,
     stack_list_of_member: HashMap<PaneId, StackListId>,
     stack_list_parked_pairs: HashMap<PaneId, PaneId>,
+    // Classic mutations temporarily dissolve lists, so retain orientation by in-grid stack id.
+    stack_list_orientation_memory: HashMap<usize, StackListOrientation>,
+    stacked_pane_list_orientation: StackListOrientation,
     next_stack_list_id: StackListId,
     stack_list_session_is_mirrored: bool,
     max_panes: Option<usize>,
@@ -289,10 +464,13 @@ pub(crate) struct Tab {
     pub style: Style,
     connected_clients: Rc<RefCell<HashSet<ClientId>>>,
     pane_frame_style: PaneFrameStyle,
+    hidden_bars: HiddenBars,
     auto_layout: bool,
     pending_vte_events: HashMap<u32, Vec<VteBytes>>,
     pub selecting_with_mouse_in_pane: Option<PaneId>, // this is only pub for the tests
     pane_being_resized_with_mouse: Option<PaneResizeState>,
+    // the client whose press started the selection, resize or move held above
+    mouse_gesture_owner: Option<ClientId>,
     link_handler: Rc<RefCell<LinkHandler>>,
     clipboard_provider: ClipboardProvider,
     // TODO: used only to focus the pane when the layout is loaded
@@ -323,6 +501,7 @@ pub(crate) struct Tab {
     web_sharing: WebSharing,
     mouse_hover_pane_id: HashMap<ClientId, PaneId>,
     mouse_press_owner: HashMap<ClientId, mouse_handler::MousePressOwner>,
+    pane_drawings: HashMap<ClientId, mouse_handler::PaneDrawing>,
     mouse_click_tracker: HashMap<ClientId, mouse_handler::MouseClickRecord>,
     dimmed_clients: HashSet<ClientId>,
     plugin_hover_pane_id: HashMap<ClientId, PaneId>,
@@ -331,6 +510,8 @@ pub(crate) struct Tab {
     mouse_help_text_visible: HashMap<ClientId, bool>,
     last_mouse_activity_time: HashMap<ClientId, Instant>,
     typed_input: TypedInput,
+    local_input: HashSet<PaneId>,
+    typed_into: HashSet<PaneId>,
     last_hint_text: HashMap<ClientId, BTreeMap<usize, StyledText>>,
     last_active_pane_scroll: HashMap<ClientId, Option<(usize, usize)>>,
     current_pane_group: Rc<RefCell<PaneGroups>>,
@@ -352,11 +533,14 @@ pub(crate) struct Tab {
     web_server_ip: IpAddr,
     web_server_port: u16,
     pub panes_with_pending_bell: HashSet<PaneId>,
+    pub pending_pane_signals: Vec<(PaneId, Vec<crate::attention::PaneSignal>)>,
+    initial_attention_muted: Option<bool>,
     pub tab_has_pending_bell: bool,
     pub tab_bell_flash: bool, // currently in mid-notification-flash
     pub tab_bell_ring: bool,  // need to send ANSI BEL to the controlling terminal
     tab_visible: bool,
     popups: HashMap<ClientId, Vec<popup::Popup>>,
+    live_views: crate::pane_mirror::SharedLiveViews,
 }
 
 // FIXME: Use a struct that has a pane_type enum, to reduce all of the duplication
@@ -401,6 +585,9 @@ pub trait Pane {
     fn selectable(&self) -> bool;
     fn set_selectable(&mut self, selectable: bool);
     fn request_permissions_from_user(&mut self, _permissions: Option<PluginPermission>) {}
+    fn is_requesting_permissions(&self) -> bool {
+        false
+    }
     fn render(
         &mut self,
         client_id: Option<ClientId>,
@@ -440,6 +627,17 @@ pub trait Pane {
     }
     fn dump_screen_with_ansi(&self, _full: bool, _client_id: Option<ClientId>) -> String {
         "".to_owned()
+    }
+    fn preview_with_anchor(
+        &self,
+        _anchor: zellij_utils::data::PreviewAnchor,
+        _max_scrollback: usize,
+    ) -> (String, Option<usize>) {
+        (self.dump_screen_with_ansi(false, None), None)
+    }
+    fn mark_unseen_output_start(&mut self) {}
+    fn program_resized_at(&self) -> Option<Instant> {
+        None
     }
     fn scroll_up(&mut self, count: usize, client_id: ClientId);
     fn scroll_down(&mut self, count: usize, client_id: ClientId);
@@ -580,6 +778,12 @@ pub trait Pane {
     fn guest_modal_selection(&self, _client_id: ClientId) -> Option<usize> {
         None
     }
+    fn guest_modal_hover(&self, _client_id: ClientId) -> Option<usize> {
+        None
+    }
+    fn set_guest_modal_hover(&mut self, _client_id: ClientId, _option: Option<usize>) -> bool {
+        false
+    }
     fn has_guest_modal_for_any_client(&self) -> bool {
         false
     }
@@ -640,6 +844,7 @@ pub trait Pane {
     fn drain_prompt_return(&mut self) -> bool {
         false
     }
+    fn reset_input_modes_left_by_lost_guest(&mut self) {}
     fn render_full_viewport(&mut self) {}
     fn relative_position(&self, position_on_screen: &Position) -> Position {
         position_on_screen.relative_to(self.get_content_y(), self.get_content_x())
@@ -806,6 +1011,19 @@ pub trait Pane {
     fn get_bell_notification(&self) -> bool {
         false
     }
+    fn set_attention_marker(
+        &mut self,
+        _marker: Option<crate::attention::FrameMarker>,
+        _enabled: bool,
+    ) {
+    }
+    fn drain_pane_signals(&mut self) -> Vec<crate::attention::PaneSignal> {
+        vec![]
+    }
+    fn set_initial_attention_flags(&mut self, _muted: bool, _ignore_output: bool) {}
+    fn take_initial_attention_flags(&mut self) -> Option<(bool, bool)> {
+        None
+    }
     fn add_red_pane_frame_color_override(&mut self, _error_text: Option<String>);
     fn add_highlight_pane_frame_color_override(
         &mut self,
@@ -819,6 +1037,12 @@ pub trait Pane {
     fn set_title(&mut self, title: String);
     fn update_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
     fn start_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
+    fn start_loading_indication_for_client(
+        &mut self,
+        _client_id: ClientId,
+        _loading_indication: LoadingIndication,
+    ) {
+    }
     fn progress_animation_offset(&mut self) {} // only relevant for plugins
     fn current_title(&self) -> String;
     fn stack_list_entry_label(&self) -> String {
@@ -857,6 +1081,9 @@ pub trait Pane {
     fn update_sixel_host_support(&mut self, _supported: bool) {}
     fn take_notification_end(&mut self) -> Option<NotificationEnd> {
         None
+    }
+    fn attach_exit_waiter(&mut self, waiter: NotificationEnd) -> Option<NotificationEnd> {
+        Some(waiter)
     }
     fn update_rounded_corners(&mut self, _rounded_corners: bool) {}
     fn invalidate_frame_cache(&mut self) {}
@@ -908,6 +1135,27 @@ pub trait Pane {
     }
     fn terminal_emulator_wants_mouse(&self) -> bool {
         false
+    }
+    fn mirror_screen(&mut self) -> Option<zellij_utils::pane_mirror::MirrorScreen> {
+        None
+    }
+    fn mouse_event_for_program(&self, _event: &MouseEvent) -> Option<String> {
+        None
+    }
+    fn program_columns(&self) -> usize {
+        self.get_content_columns()
+    }
+    fn program_rows(&self) -> usize {
+        self.get_content_rows()
+    }
+    fn mirror_pinned_size(&self) -> Option<Size> {
+        None
+    }
+    fn set_mirror_pinned_size(&mut self, _size: Option<Size>) -> bool {
+        false
+    }
+    fn mirror_change_counter(&self) -> u64 {
+        0
     }
 }
 
@@ -961,6 +1209,7 @@ impl Tab {
         character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
         stacked_resize: Rc<RefCell<bool>>,
         stacked_pane_list: Rc<RefCell<bool>>,
+        stacked_pane_list_orientation: StackListOrientation,
         sixel_image_store: Rc<RefCell<SixelImageStore>>,
         kitty_image_store: Rc<RefCell<KittyImageStore>>,
         os_api: Box<dyn ServerOsApi>,
@@ -1075,6 +1324,8 @@ impl Tab {
             stack_lists: HashMap::new(),
             stack_list_of_member: HashMap::new(),
             stack_list_parked_pairs: HashMap::new(),
+            stack_list_orientation_memory: HashMap::new(),
+            stacked_pane_list_orientation,
             next_stack_list_id: 0,
             stack_list_session_is_mirrored: session_is_mirrored,
             name: name.clone(),
@@ -1095,11 +1346,13 @@ impl Tab {
             mode_info,
             default_mode_info,
             pane_frame_style,
+            hidden_bars: HiddenBars::default(),
             auto_layout,
             pending_vte_events: HashMap::new(),
             connected_clients,
             selecting_with_mouse_in_pane: None,
             pane_being_resized_with_mouse: None,
+            mouse_gesture_owner: None,
             link_handler: Rc::new(RefCell::new(LinkHandler::new())),
             clipboard_provider,
             focus_pane_id: None,
@@ -1125,6 +1378,7 @@ impl Tab {
             web_sharing,
             mouse_hover_pane_id: HashMap::new(),
             mouse_press_owner: HashMap::new(),
+            pane_drawings: HashMap::new(),
             mouse_click_tracker: HashMap::new(),
             plugin_hover_pane_id: HashMap::new(),
             popup_hover_plugin_id: HashMap::new(),
@@ -1132,6 +1386,8 @@ impl Tab {
             mouse_help_text_visible: HashMap::new(),
             last_mouse_activity_time: HashMap::new(),
             typed_input: TypedInput::default(),
+            local_input: HashSet::new(),
+            typed_into: HashSet::new(),
             last_hint_text: HashMap::new(),
             last_active_pane_scroll: HashMap::new(),
             current_pane_group,
@@ -1151,12 +1407,15 @@ impl Tab {
             web_server_ip,
             web_server_port,
             panes_with_pending_bell: HashSet::new(),
+            pending_pane_signals: Vec::new(),
+            initial_attention_muted: None,
             tab_has_pending_bell: false,
             tab_bell_flash: false,
             tab_bell_ring: false,
             dimmed_clients: HashSet::new(),
             tab_visible: true,
             popups: HashMap::new(),
+            live_views: Default::default(),
         }
     }
 
@@ -1204,6 +1463,39 @@ impl Tab {
             None => false,
         }
     }
+    pub fn stack_list_orientation_of_member(
+        &self,
+        pane_id: &PaneId,
+    ) -> Option<StackListOrientation> {
+        self.stack_list_id_of_member(pane_id)
+            .and_then(|stack_list_id| self.stack_lists.get(&stack_list_id))
+            .map(|list| list.orientation)
+    }
+    pub fn position_is_on_stack_list_titles(&self, pane_id: PaneId, point: &Position) -> bool {
+        if self.tiled_panes.fullscreen_is_active() {
+            return false;
+        }
+        let Some(list) = self
+            .stack_list_id_of_member(&pane_id)
+            .and_then(|stack_list_id| self.stack_lists.get(&stack_list_id))
+        else {
+            return false;
+        };
+        let Some(pane) = self.tiled_panes.get_pane(list.visible) else {
+            return false;
+        };
+        let geom = pane.current_geom();
+        let title_rows = match list.orientation {
+            StackListOrientation::Vertical => list.members.len(),
+            StackListOrientation::Horizontal => 1,
+        };
+        let line = point.line();
+        let column = point.column();
+        line >= geom.y as isize
+            && line < (geom.y + title_rows) as isize
+            && column >= geom.x
+            && column < geom.x + geom.cols.as_usize()
+    }
     fn stack_list_member_at_point(&self, pane_id: PaneId, point: &Position) -> PaneId {
         let Some(stack_list_id) = self.stack_list_id_of_member(&pane_id) else {
             return pane_id;
@@ -1215,17 +1507,74 @@ impl Tab {
             return pane_id;
         };
         let geom = pane.current_geom();
-        if point.line() < geom.y as isize {
-            return pane_id;
+        match list.orientation {
+            StackListOrientation::Vertical => {
+                if point.line() < geom.y as isize {
+                    return pane_id;
+                }
+                let rank = (point.line() - geom.y as isize) as usize;
+                list.members.get(rank).copied().unwrap_or(pane_id)
+            },
+            StackListOrientation::Horizontal => {
+                if point.line() != geom.y as isize {
+                    return pane_id;
+                }
+                let offset = pane.get_content_offset();
+                let entry_x = geom.x + offset.left;
+                let entry_cols = geom
+                    .cols
+                    .as_usize()
+                    .saturating_sub(offset.left + offset.right);
+                let column = point.column();
+                if column < entry_x {
+                    return pane_id;
+                }
+                for entry in self.stack_list_row_layout(list, entry_cols).entries {
+                    if (entry_x + entry.x..entry_x + entry.x + entry.width).contains(&column) {
+                        return entry.member;
+                    }
+                }
+                pane_id
+            },
         }
-        let rank = (point.line() - geom.y as isize) as usize;
-        list.members.get(rank).copied().unwrap_or(pane_id)
+    }
+    fn stack_list_member_label_width(&self, list: &StackList, member: &PaneId) -> usize {
+        let pane = if *member == list.visible {
+            self.tiled_panes.get_pane(*member).map(|p| &**p)
+        } else {
+            self.suppressed_panes.get(member).map(|(_, p)| &**p)
+        };
+        pane.map(|p| zellij_utils::graphemes::display_width(&p.stack_list_entry_label()))
+            .unwrap_or(0)
+    }
+    fn stack_list_row_layout(&self, list: &StackList, entry_cols: usize) -> StackListRowLayout {
+        let members: Vec<(PaneId, usize)> = list
+            .members
+            .iter()
+            .map(|member| (*member, self.stack_list_member_label_width(list, member)))
+            .collect();
+        let selected = list.rank_of(&list.visible).unwrap_or(0);
+        layout_stack_list_row(&members, selected, entry_cols)
     }
     pub fn suppressed_stack_list_members(&self) -> impl Iterator<Item = (&PaneId, &Box<dyn Pane>)> {
         self.suppressed_panes
             .iter()
             .filter(|(pane_id, _)| self.stack_list_of_member.contains_key(pane_id))
             .map(|(pane_id, (_, pane))| (pane_id, pane))
+    }
+    pub(crate) fn stack_list_orientation_for_serialization(
+        &self,
+        pane_id: &PaneId,
+    ) -> Option<StackListOrientation> {
+        self.stack_list_id_of_member(pane_id)
+            .and_then(|id| self.stack_lists.get(&id))
+            .map(|list| list.orientation)
+            .or_else(|| {
+                self.tiled_panes
+                    .get_pane(*pane_id)
+                    .and_then(|pane| pane.position_and_size().stacked)
+                    .and_then(|id| self.stack_list_orientation_memory.get(&id).copied())
+            })
     }
     pub fn tiled_pane_serialization_geoms(&self) -> HashMap<PaneId, PaneGeom> {
         let expanded_geoms = self
@@ -1282,7 +1631,12 @@ impl Tab {
     }
     pub fn hidden_stack_list_members_for_serialization(
         &self,
-    ) -> Vec<(PaneId, &Box<dyn Pane>, PaneGeom)> {
+    ) -> Vec<(
+        PaneId,
+        &Box<dyn Pane>,
+        PaneGeom,
+        Option<StackListOrientation>,
+    )> {
         let synthetic_geoms = self.tiled_pane_serialization_geoms();
         let mut hidden_members = vec![];
         for list in self.stack_lists.values() {
@@ -1300,7 +1654,7 @@ impl Tab {
                     .filter(|(is_scrollback_editor, _)| *is_scrollback_editor)
                     .or_else(|| self.suppressed_panes.get(member));
                 if let Some((_, pane)) = resolved_pane {
-                    hidden_members.push((pane.pid(), pane, *member_geom));
+                    hidden_members.push((pane.pid(), pane, *member_geom, Some(list.orientation)));
                 }
             }
         }
@@ -1320,16 +1674,20 @@ impl Tab {
         }
     }
     fn refresh_or_dissolve_stack_list(&mut self, stack_list_id: StackListId) {
-        let (member_count, visible) = match self.stack_lists.get(&stack_list_id) {
-            Some(list) => (list.members.len(), list.visible),
+        let (member_count, visible, orientation) = match self.stack_lists.get(&stack_list_id) {
+            Some(list) => (list.members.len(), list.visible, list.orientation),
             None => return,
         };
         if member_count <= 1 {
             self.dissolve_stack_list(stack_list_id);
         } else {
+            let reserved_rows = match orientation {
+                StackListOrientation::Vertical => member_count + 1,
+                StackListOrientation::Horizontal => 1,
+            };
             self.reserved_top_rows
                 .borrow_mut()
-                .insert(visible, member_count + 1);
+                .insert(visible, reserved_rows);
             self.tiled_panes.reapply_pane_frames();
             self.resize_stack_list_hidden_members(stack_list_id);
         }
@@ -1424,7 +1782,12 @@ impl Tab {
         self.tiled_panes.move_client_focus_to_existing_panes();
         self.set_force_render();
     }
-    fn move_focus_within_stack_list(&mut self, client_id: ClientId, down: bool) -> bool {
+    fn move_focus_within_stack_list(
+        &mut self,
+        client_id: ClientId,
+        down: bool,
+        axis: StackListOrientation,
+    ) -> bool {
         let active_pane_id = match self.tiled_panes.get_active_pane_id(client_id) {
             Some(id) => id,
             None => return false,
@@ -1438,6 +1801,9 @@ impl Tab {
                 Some(l) => l,
                 None => return false,
             };
+            if list.orientation != axis {
+                return false;
+            }
             if list.visible != active_pane_id {
                 return false;
             }
@@ -1458,6 +1824,31 @@ impl Tab {
             }
         };
         self.select_stack_list_member(stack_list_id, target_member, Some(client_id))
+    }
+    pub fn toggle_stack_list_orientation(&mut self, client_id: ClientId) -> bool {
+        match self.tiled_panes.get_active_pane_id(client_id) {
+            Some(active_pane_id) => self.toggle_stack_list_orientation_of_pane(active_pane_id),
+            None => false,
+        }
+    }
+    pub fn toggle_stack_list_orientation_of_pane(&mut self, pane_id: PaneId) -> bool {
+        let stack_list_id = match self.stack_list_id_of_member(&pane_id) {
+            Some(id) => id,
+            None => return false,
+        };
+        match self.stack_lists.get_mut(&stack_list_id) {
+            Some(list) => {
+                list.orientation = match list.orientation {
+                    StackListOrientation::Vertical => StackListOrientation::Horizontal,
+                    StackListOrientation::Horizontal => StackListOrientation::Vertical,
+                };
+            },
+            None => return false,
+        }
+        self.refresh_or_dissolve_stack_list(stack_list_id);
+        self.set_force_render();
+        self.set_should_clear_display_before_rendering();
+        true
     }
     fn close_stack_list_member(&mut self, id: PaneId, exit_status: Option<i32>) -> bool {
         match self.remove_stack_list_member(id) {
@@ -1603,8 +1994,8 @@ impl Tab {
         }
     }
     fn degroupify(&mut self, stack_list_id: StackListId) {
-        let (members, visible) = match self.stack_lists.get(&stack_list_id) {
-            Some(list) => (list.members.clone(), list.visible),
+        let (members, visible, orientation) = match self.stack_lists.get(&stack_list_id) {
+            Some(list) => (list.members.clone(), list.visible, list.orientation),
             None => return,
         };
         let n = members.len();
@@ -1616,6 +2007,10 @@ impl Tab {
         if geoms.len() != n {
             log::error!("degroupify: could not compute classic stack geoms");
             return;
+        }
+        if let Some(classic_stack_id) = geoms.first().and_then(|g| g.stacked) {
+            self.stack_list_orientation_memory
+                .insert(classic_stack_id, orientation);
         }
         for (i, member) in members.iter().enumerate() {
             let mut geom = geoms[i];
@@ -1677,11 +2072,19 @@ impl Tab {
                     .push((geom.y, *id, is_expanded));
             }
         }
+        let single_member_stacks: HashSet<_> = stacks
+            .iter()
+            .filter_map(|(id, members)| (members.len() == 1).then_some(*id))
+            .collect();
         let mut converted_any = false;
-        for (_stack_id, mut members) in stacks {
+        for (stack_id, mut members) in stacks {
             if members.len() < 2 {
                 continue;
             }
+            let orientation = self
+                .stack_list_orientation_memory
+                .remove(&stack_id)
+                .unwrap_or(self.stacked_pane_list_orientation);
             members.sort_by_key(|(y, _, _)| *y);
             let representative = members[0].1;
             let rect = match self.tiled_panes.position_and_size_of_stack(&representative) {
@@ -1730,11 +2133,14 @@ impl Tab {
                 StackList {
                     members: ordered_ids,
                     visible,
+                    orientation,
                 },
             );
             self.refresh_or_dissolve_stack_list(stack_list_id);
             converted_any = true;
         }
+        self.stack_list_orientation_memory
+            .retain(|id, _| single_member_stacks.contains(id));
         if converted_any {
             self.set_force_render();
             self.set_should_clear_display_before_rendering();
@@ -1771,6 +2177,35 @@ impl Tab {
                 let _ = resize_pty!(pane, self.os_api, self.senders, self.character_cell_size);
             }
         }
+    }
+    fn stack_list_row_filler(
+        &self,
+        row_layout: &StackListRowLayout,
+        entry_cols: usize,
+        stack_is_focused: bool,
+    ) -> Vec<TerminalCharacter> {
+        let mut row = vec![EMPTY_TERMINAL_CHARACTER; entry_cols];
+        let mut place = |text: &str, x: usize| {
+            for (offset, character) in stack_list_row_filler(text, &self.style, stack_is_focused)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(cell) = row.get_mut(x + offset) {
+                    *cell = character;
+                }
+            }
+        };
+        for entry in row_layout.entries.iter().skip(1) {
+            place(boundary_type::VERTICAL, entry.x - 1);
+        }
+        let before = stack_list_row_overflow_marker(row_layout.hidden_before, true);
+        let after = stack_list_row_overflow_marker(row_layout.hidden_after, false);
+        let after_width = after.chars().count();
+        if before.chars().count() + after_width <= entry_cols {
+            place(&before, 0);
+            place(&after, entry_cols - after_width);
+        }
+        row
     }
     fn render_stack_list_headers(
         &mut self,
@@ -1821,28 +2256,70 @@ impl Tab {
             let widest_member_title = list
                 .members
                 .iter()
-                .filter_map(|member| {
-                    if *member == list.visible {
-                        self.tiled_panes.get_pane(*member).map(|p| &**p)
-                    } else {
-                        self.suppressed_panes.get(member).map(|(_, p)| &**p)
-                    }
-                })
-                .map(|pane| zellij_utils::graphemes::display_width(&pane.stack_list_entry_label()))
+                .map(|member| self.stack_list_member_label_width(&list, member))
                 .max()
                 .unwrap_or(0);
             let stack_is_focused = active_panes.values().any(|p_id| *p_id == list.visible);
-            for (rank, member) in list.members.iter().enumerate() {
+            let entries = match list.orientation {
+                StackListOrientation::Vertical => list
+                    .members
+                    .iter()
+                    .map(|member| StackListEntryLayout {
+                        member: *member,
+                        x: 0,
+                        label_width: widest_member_title,
+                        width: entry_cols,
+                    })
+                    .collect(),
+                StackListOrientation::Horizontal => {
+                    let row_layout = self.stack_list_row_layout(&list, entry_cols);
+                    let filler =
+                        self.stack_list_row_filler(&row_layout, entry_cols, stack_is_focused);
+                    let mut covered = vec![false; entry_cols];
+                    for entry in &row_layout.entries {
+                        for column in entry.x..(entry.x + entry.width).min(entry_cols) {
+                            covered[column] = true;
+                        }
+                    }
+                    let mut column = 0;
+                    while column < entry_cols {
+                        if covered[column] {
+                            column += 1;
+                            continue;
+                        }
+                        let gap_start = column;
+                        while column < entry_cols && !covered[column] {
+                            column += 1;
+                        }
+                        output.add_character_chunks_to_multiple_clients(
+                            vec![CharacterChunk::new(
+                                filler[gap_start..column].to_vec(),
+                                entry_x + gap_start,
+                                rect.y,
+                            )],
+                            connected_clients.iter().copied(),
+                            None,
+                        )?;
+                    }
+                    row_layout.entries
+                },
+            };
+            for (rank, entry) in entries.iter().enumerate() {
                 let mut header_geom = rect;
-                header_geom.x = entry_x;
-                header_geom.cols.set_inner(entry_cols);
-                header_geom.y = rect.y + rank;
+                header_geom.x = entry_x + entry.x;
+                header_geom.cols.set_inner(entry.width);
+                header_geom.y = rect.y
+                    + if list.orientation == StackListOrientation::Vertical {
+                        rank
+                    } else {
+                        0
+                    };
                 header_geom.rows = Dimension::fixed(1);
                 header_geom.stacked = None;
-                let pane_box = if *member == list.visible {
-                    self.tiled_panes.get_pane_mut(*member)
+                let pane_box = if entry.member == list.visible {
+                    self.tiled_panes.get_pane_mut(entry.member)
                 } else {
-                    self.suppressed_panes.get_mut(member).map(|(_, p)| p)
+                    self.suppressed_panes.get_mut(&entry.member).map(|(_, p)| p)
                 };
                 let pane_box = match pane_box {
                     Some(p) => p,
@@ -1869,9 +2346,10 @@ impl Tab {
                 );
                 pane_contents_and_ui.set_frame_geom_override(Some(header_geom));
                 pane_contents_and_ui.set_stack_list_entry(
-                    Some(widest_member_title),
-                    *member == list.visible,
+                    Some(entry.label_width),
+                    entry.member == list.visible,
                     stack_is_focused,
+                    list.orientation == StackListOrientation::Horizontal,
                 );
                 for (client_id, client_mode) in &client_modes {
                     pane_contents_and_ui.render_pane_frame(
@@ -1883,17 +2361,19 @@ impl Tab {
                     )?;
                 }
             }
-            let mut padding_row = Vec::with_capacity(entry_cols);
-            for _ in 0..entry_cols {
-                padding_row.push(EMPTY_TERMINAL_CHARACTER);
+            if list.orientation == StackListOrientation::Vertical {
+                let mut padding_row = Vec::with_capacity(entry_cols);
+                for _ in 0..entry_cols {
+                    padding_row.push(EMPTY_TERMINAL_CHARACTER);
+                }
+                let padding_chunk =
+                    CharacterChunk::new(padding_row, entry_x, rect.y + list.members.len());
+                output.add_character_chunks_to_multiple_clients(
+                    vec![padding_chunk],
+                    connected_clients.iter().copied(),
+                    None,
+                )?;
             }
-            let padding_chunk =
-                CharacterChunk::new(padding_row, entry_x, rect.y + list.members.len());
-            output.add_character_chunks_to_multiple_clients(
-                vec![padding_chunk],
-                connected_clients.iter().copied(),
-                None,
-            )?;
         }
         Ok(())
     }
@@ -1908,6 +2388,9 @@ impl Tab {
         client_id: ClientId,
         blocking_terminal: Option<(u32, NotificationEnd)>,
     ) -> Result<()> {
+        if layout.attention_muted.is_some() {
+            self.initial_attention_muted = layout.attention_muted;
+        }
         self.swap_layouts
             .set_base_layout((layout.clone(), floating_panes_layout.clone()));
         match LayoutApplier::new(
@@ -1943,7 +2426,9 @@ impl Tab {
             new_plugin_ids,
             client_id,
         ) {
-            Ok(should_show_floating_panes) => {
+            Ok((should_show_floating_panes, stack_orientations)) => {
+                self.stack_list_orientation_memory
+                    .extend(stack_orientations);
                 if should_show_floating_panes
                     && !self.floating_panes.panes_are_visible()
                     && self.floating_panes.has_selectable_panes()
@@ -2038,7 +2523,9 @@ impl Tab {
             retain_existing_plugin_panes,
             client_id,
         ) {
-            Ok(should_show_floating_panes) => {
+            Ok((should_show_floating_panes, stack_orientations)) => {
+                self.stack_list_orientation_memory
+                    .extend(stack_orientations);
                 if should_show_floating_panes
                     && !self.floating_panes.panes_are_visible()
                     && self.floating_panes.has_selectable_panes()
@@ -2162,7 +2649,7 @@ impl Tab {
     /// The layout offsets the viewport while the collapsed panes are still taking part, so a
     /// collapsed bar would go on holding its row out of the viewport. Offset it again once
     /// they are gone, the same as `resize_whole_tab` does.
-    fn restore_collapsed_panes_after_relayout(&mut self, collapsed_panes: HashSet<PaneId>) {
+    fn restore_collapsed_panes_after_relayout(&mut self, collapsed_panes: CoveredPanes) {
         if self.tiled_panes.restore_collapsed_panes(collapsed_panes) {
             let display_area = *self.display_area.borrow();
             self.tiled_panes.resize(display_area);
@@ -2206,7 +2693,9 @@ impl Tab {
             .with_grapheme_clusters(self.grapheme_clusters)
             .apply_tiled_panes_layout_to_existing_panes(&layout_candidate);
             match application_res {
-                Ok(panes_were_floated) => {
+                Ok((panes_were_floated, stack_orientations)) => {
+                    self.stack_list_orientation_memory
+                        .extend(stack_orientations);
                     if panes_were_floated {
                         self.swap_layouts.set_is_floating_damaged();
                         self.floating_panes.set_force_render();
@@ -2354,6 +2843,7 @@ impl Tab {
                 mode_info.web_server_capability = Some(false);
             }
             mode_info.pane_frame_style = Some(self.pane_frame_style);
+            mode_info.hidden_bars = self.hidden_bars.clone();
             for plugin_id in self.popup_plugin_ids_for_client(*client_id) {
                 plugin_updates.push((
                     Some(plugin_id),
@@ -2377,15 +2867,6 @@ impl Tab {
         Ok(())
     }
     fn resolve_hint_text(&self, client_id: ClientId) -> BTreeMap<usize, StyledText> {
-        let focused_pane_id = self.get_active_pane_id(client_id);
-        let hovered_pane_id = self.mouse_hover_pane_id.get(&client_id).copied();
-        if self.mouse_hover_tips {
-            if let Some(hovered_pane_id) = hovered_pane_id {
-                if Some(hovered_pane_id) != focused_pane_id {
-                    return hover_hint_variants();
-                }
-            }
-        }
         if let Some(focused_pane) = self.get_active_pane(client_id) {
             if focused_pane.is_held() {
                 let exited = focused_pane.exited();
@@ -2399,19 +2880,6 @@ impl Tab {
                     None
                 };
                 return held_hint_variants(is_first_run, exit_status);
-            }
-        }
-        let resize_help_visible = self
-            .mouse_help_text_visible
-            .get(&client_id)
-            .copied()
-            .unwrap_or(false);
-        if resize_help_visible && self.mouse_hover_tips {
-            let selectable_pane_count = self.get_selectable_tiled_panes().count()
-                + self.get_selectable_floating_panes().count();
-            if selectable_pane_count > 1 && !self.is_fullscreen_active() {
-                let focused_pane_is_floating = self.floating_panes.panes_are_visible();
-                return resize_hint_variants(focused_pane_is_floating, self.mouse_scroll_resize);
             }
         }
         BTreeMap::new()
@@ -2472,7 +2940,10 @@ impl Tab {
         if !self.single_pane_titles() {
             return None;
         }
-        let (_, pane) = self.get_selectable_tiled_content_panes().next()?;
+        let (pane_id, pane) = self.get_selectable_tiled_content_panes().next()?;
+        if self.pane_is_stack_list_member(pane_id) {
+            return None;
+        }
         let (position, length) = pane.scroll_position();
         if position > 0 || length > 0 {
             Some((position, length))
@@ -2575,6 +3046,7 @@ impl Tab {
             } else {
                 None
             };
+            self.forget_mouse_gestures_held_by(client_id, is_last_connected_client);
         }
         let was_dimmed = self.dimmed_clients.contains(&client_id);
         self.mode_info.borrow_mut().remove(&client_id);
@@ -2582,10 +3054,34 @@ impl Tab {
         self.mouse_help_text_visible.remove(&client_id);
         self.mouse_last_pane_id.remove(&client_id);
         self.last_mouse_activity_time.remove(&client_id);
+        self.pane_drawings.remove(&client_id);
+        self.mouse_click_tracker.remove(&client_id);
         if is_connected_to_this_tab || was_dimmed {
             self.set_client_dimmed(client_id, false);
             self.set_force_render();
         }
+    }
+    // The release that would end a gesture goes wherever its client is now, so a gesture
+    // started by a client that leaves this tab would otherwise swallow the next press here
+    fn forget_mouse_gestures_held_by(&mut self, client_id: ClientId, no_client_is_left: bool) {
+        if no_client_is_left || self.mouse_gesture_owner == Some(client_id) {
+            self.forget_held_mouse_gestures();
+        }
+    }
+    fn forget_held_mouse_gestures(&mut self) {
+        if let Some(pane_id) = self.selecting_with_mouse_in_pane.take() {
+            if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+                pane.reset_selection(None);
+            }
+        }
+        self.pane_being_resized_with_mouse = None;
+        self.floating_panes.forget_pane_being_moved_with_mouse();
+        self.mouse_gesture_owner = None;
+    }
+    fn tab_wide_mouse_gesture_is_held(&self) -> bool {
+        self.selecting_with_mouse_in_pane.is_some()
+            || self.pane_being_resized_with_mouse.is_some()
+            || self.floating_panes.pane_is_being_moved_with_mouse()
     }
     pub fn drain_connected_clients(
         &mut self,
@@ -2607,7 +3103,20 @@ impl Tab {
             .remove(&client_id)
             .unwrap_or_else(|| self.default_mode_info.clone());
         self.connected_clients.borrow_mut().remove(&client_id);
+        let no_client_is_left = self.connected_clients.borrow().is_empty();
+        self.forget_mouse_gestures_held_by(client_id, no_client_is_left);
+        self.pane_drawings.remove(&client_id);
+        self.mouse_click_tracker.remove(&client_id);
         (client_id, client_mode_info)
+    }
+    pub fn client_has_valid_pane_focus(&self, client_id: ClientId) -> bool {
+        self.tiled_panes
+            .focused_pane_id(client_id)
+            .is_some_and(|id| self.tiled_panes.panes_contain(&id))
+            || self
+                .floating_panes
+                .active_pane_id(client_id)
+                .is_some_and(|id| self.floating_panes.panes_contain(&id))
     }
     pub fn has_no_connected_clients(&self) -> bool {
         self.connected_clients.borrow().is_empty()
@@ -2697,6 +3206,31 @@ impl Tab {
         } else if self.pane_is_hidden_stack_list_member(&pane_id) {
             if let Some(hidden_member_to_float) = self.extract_pane(pane_id, true) {
                 self.add_floating_pane(hidden_member_to_float, pane_id, None, true, client_id)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn move_pane_between_layers(
+        &mut self,
+        pane_id: PaneId,
+        client_id: Option<ClientId>,
+    ) -> Result<()> {
+        let client_id =
+            client_id.filter(|client_id| self.connected_clients.borrow().contains(client_id));
+        let was_floating = self.floating_panes.panes_contain(&pane_id);
+        self.toggle_pane_embed_or_floating_for_pane_id(pane_id, client_id)?;
+        let is_floating = self.floating_panes.panes_contain(&pane_id);
+        if was_floating && !is_floating && self.tiled_panes.panes_contain(&pane_id) {
+            self.hide_floating_panes();
+            match client_id {
+                Some(client_id) => self.tiled_panes.focus_pane(pane_id, client_id),
+                None => self.tiled_panes.focus_pane_for_all_clients(pane_id),
+            }
+        } else if !was_floating && is_floating {
+            self.show_floating_panes();
+            match client_id {
+                Some(client_id) => self.floating_panes.focus_pane(pane_id, client_id),
+                None => self.floating_panes.focus_pane_for_all_clients(pane_id),
             }
         }
         Ok(())
@@ -4336,6 +4870,9 @@ impl Tab {
         }
         had_bell
     }
+    pub fn take_initial_attention_muted(&mut self) -> Option<bool> {
+        self.initial_attention_muted.take()
+    }
     pub fn has_terminal_pid(&self, pid: u32) -> bool {
         self.tiled_panes.panes_contain(&PaneId::Terminal(pid))
             || self.floating_panes.panes_contain(&PaneId::Terminal(pid))
@@ -4444,6 +4981,19 @@ impl Tab {
         {
             pane.set_is_nested_guest(is_nested_guest);
         }
+    }
+    pub fn is_pane_requesting_permissions(&self, pane_id: PaneId) -> bool {
+        self.tiled_panes
+            .get_pane(pane_id)
+            .or_else(|| self.floating_panes.get_pane(pane_id))
+            .or_else(|| {
+                self.suppressed_panes
+                    .values()
+                    .find(|s_p| s_p.1.pid() == pane_id)
+                    .map(|s_p| &s_p.1)
+            })
+            .map(|pane| pane.is_requesting_permissions())
+            .unwrap_or(false)
     }
     pub fn is_pane_nested_guest(&self, pane_id: PaneId) -> bool {
         if let Some(pane) = self
@@ -4564,6 +5114,34 @@ impl Tab {
         } else {
             false
         }
+    }
+    pub fn set_guest_modal_hover_for_client(
+        &mut self,
+        client_id: ClientId,
+        hovered: Option<(PaneId, usize)>,
+    ) -> bool {
+        let mut changed = false;
+        for pane_id in self.get_all_pane_ids() {
+            let option = hovered
+                .filter(|(hovered_pane_id, _)| *hovered_pane_id == pane_id)
+                .map(|(_, option)| option);
+            if let Some(pane) = self
+                .tiled_panes
+                .get_pane_mut(pane_id)
+                .or_else(|| self.floating_panes.get_pane_mut(pane_id))
+                .or_else(|| {
+                    self.suppressed_panes
+                        .values_mut()
+                        .find(|s_p| s_p.1.pid() == pane_id)
+                        .map(|s_p| &mut s_p.1)
+                })
+            {
+                if pane.set_guest_modal_hover(client_id, option) {
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
     pub fn clear_guest_modal_for_client_on_all_panes(&mut self, client_id: ClientId) {
         for pane_id in self.get_all_pane_ids() {
@@ -4772,6 +5350,11 @@ impl Tab {
             let desktop_notifications = terminal_output.drain_desktop_notifications();
             let osc7_cwd = terminal_output.drain_osc7_cwd();
             let prompt_returned = terminal_output.drain_prompt_return();
+            let pane_signals = terminal_output.drain_pane_signals();
+            if !pane_signals.is_empty() {
+                self.pending_pane_signals
+                    .push((PaneId::Terminal(pid), pane_signals));
+            }
             for message in messages_to_pty {
                 self.write_to_pane_id_without_preprocessing(message, PaneId::Terminal(pid))
                     .with_context(err_context)?;
@@ -4813,6 +5396,11 @@ impl Tab {
                 let _ = self
                     .senders
                     .send_to_pty(PtyInstruction::PromptReturned(pid));
+                let _ = self
+                    .senders
+                    .send_to_screen(ScreenInstruction::PromptReturnedInPane {
+                        pane_id: PaneId::Terminal(pid),
+                    });
             }
         }
         Ok(())
@@ -4933,14 +5521,80 @@ impl Tab {
         bytes: Vec<u8>,
         pane_id: PaneId,
         completion: Option<NotificationEnd>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bracketed_paste_begin = vec![27, 91, 50, 48, 48, 126];
         let bracketed_paste_end = vec![27, 91, 50, 48, 49, 126];
+        let bytes = without_paste_markers(bytes);
 
-        self.write_to_pane_id(&None, bracketed_paste_begin, false, pane_id, None, None)?;
-        self.write_to_pane_id(&None, bytes, false, pane_id, None, None)?;
-        self.write_to_pane_id(&None, bracketed_paste_end, false, pane_id, None, completion)?;
+        let mut should_update_ui = false;
+        let writes = [
+            (bracketed_paste_begin, None),
+            (bytes, None),
+            (bracketed_paste_end, completion),
+        ];
+        for (bytes, completion) in writes {
+            match self.write_to_pane_id(&None, bytes, false, pane_id, None, completion) {
+                Ok(updated) => should_update_ui |= updated,
+                Err(_) if should_update_ui => return Ok(true),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(should_update_ui)
+    }
+
+    pub fn send_mouse_event_to_pane_id(
+        &mut self,
+        pane_id: PaneId,
+        event: &MouseEvent,
+    ) -> Result<()> {
+        let Some(pane) = self.get_pane_with_id(pane_id) else {
+            return Ok(());
+        };
+        let inside = event.position.line() >= 0
+            && (event.position.line() as usize) < pane.get_content_rows()
+            && event.position.column() < pane.get_content_columns();
+        if !inside {
+            return Ok(());
+        }
+        if let Some(report) = pane.mouse_event_for_program(event) {
+            self.write_to_pane_id(&None, report.into_bytes(), false, pane_id, None, None)?;
+        }
         Ok(())
+    }
+
+    pub fn set_mirror_pinned_size(&mut self, pane_id: PaneId, size: Option<Size>) -> bool {
+        let pane = self
+            .tiled_panes
+            .get_pane_mut(pane_id)
+            .or_else(|| self.floating_panes.get_pane_mut(pane_id))
+            .or_else(|| {
+                self.suppressed_panes
+                    .get_mut(&pane_id)
+                    .map(|(_, pane)| pane)
+            });
+        let Some(pane) = pane else {
+            return false;
+        };
+        if !pane.set_mirror_pinned_size(size) {
+            return false;
+        }
+        resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
+        true
+    }
+
+    pub fn take_local_input(&mut self) -> HashSet<PaneId> {
+        std::mem::take(&mut self.local_input)
+    }
+
+    pub fn note_typed_input(&mut self, pane_id: PaneId) {
+        if let PaneId::Terminal(terminal_id) = pane_id {
+            self.typed_input.record(terminal_id, Instant::now());
+            self.typed_into.insert(pane_id);
+        }
+    }
+
+    pub fn take_typed_into(&mut self) -> HashSet<PaneId> {
+        std::mem::take(&mut self.typed_into)
     }
 
     pub fn paste_to_active_terminal(
@@ -4948,12 +5602,21 @@ impl Tab {
         bytes: Vec<u8>,
         client_id: ClientId,
         completion: Option<NotificationEnd>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let err_context = || format!("failed to paste to active terminal for client {client_id}");
+        if let Some(PaneId::Plugin(plugin_id)) = self.live_view_focus(client_id) {
+            if self.live_views.borrow().is_captured(plugin_id, client_id) {
+                self.live_views.borrow_mut().send_paste(client_id, bytes);
+                drop(completion);
+                return Ok(false);
+            }
+        }
         let active_pane_id = self
             .get_active_pane_id(client_id)
             .ok_or_else(|| anyhow!("no active pane for client {client_id}"))
             .with_context(err_context)?;
+        self.local_input.insert(active_pane_id);
+        self.typed_into.insert(active_pane_id);
         self.paste_to_pane_id(bytes, active_pane_id, completion)
     }
 
@@ -4971,6 +5634,7 @@ impl Tab {
 
         let mut should_update_ui = false;
         let is_sync_panes_active = self.is_sync_panes_active();
+        let live_view_focus = client_id.and_then(|client_id| self.live_view_focus(client_id));
 
         let active_pane = self
             .floating_panes
@@ -4990,6 +5654,28 @@ impl Tab {
             return Ok(should_update_ui);
         }
 
+        if let (PaneId::Plugin(plugin_id), Some(client_id)) = (pane_id, client_id) {
+            if self.live_views.borrow().is_captured(plugin_id, client_id)
+                && live_view_focus == Some(pane_id)
+            {
+                self.live_views.borrow_mut().send_key(
+                    client_id,
+                    key_with_modifier,
+                    &raw_input_bytes,
+                    raw_input_bytes_are_kitty,
+                );
+                drop(completion_tx);
+                return Ok(false);
+            }
+        }
+
+        let more_than_enter = !key_with_modifier
+            .as_ref()
+            .map(|key| key.bare_key == BareKey::Enter && key.has_no_modifiers())
+            .unwrap_or(false)
+            && raw_input_bytes
+                .iter()
+                .any(|byte| *byte != b'\r' && *byte != b'\n');
         match pane_id {
             PaneId::Terminal(active_terminal_id) => {
                 match active_pane.adjust_input_to_terminal(
@@ -5001,6 +5687,10 @@ impl Tab {
                     Some(AdjustedInput::WriteBytesToTerminal(adjusted_input)) => {
                         if client_id.is_some() {
                             self.typed_input.record(active_terminal_id, Instant::now());
+                            self.local_input.insert(pane_id);
+                            if more_than_enter {
+                                self.typed_into.insert(pane_id);
+                            }
                         }
                         self.senders
                             .send_to_pty_writer(PtyWriteInstruction::Write(
@@ -5435,10 +6125,18 @@ impl Tab {
                 .with_context(err_context)
                 .non_fatal();
         }
-        self.render_popups(output, display_will_be_cleared)
-            .with_context(err_context)?;
+        self.render_popups(
+            output,
+            display_will_be_cleared,
+            client_id_override.is_none(),
+        )
+        .with_context(err_context)?;
+        if client_id_override.is_none() {
+            self.render_pane_drawings(output)
+                .with_context(err_context)?;
+        }
 
-        self.render_cursor(output);
+        self.render_cursor(output, client_id_override.is_none());
         if output.has_rendered_assets() {
             self.hide_cursor_and_clear_display_as_needed(output);
         }
@@ -5447,6 +6145,26 @@ impl Tab {
         self.emit_active_pane_scroll_if_changed()
             .with_context(err_context)?;
 
+        Ok(())
+    }
+
+    fn render_pane_drawings(&self, output: &mut Output) -> Result<()> {
+        let viewport = *self.viewport.borrow();
+        let color = self.style.colors.frame_selected.base;
+        let connected_clients = self.connected_clients.borrow();
+        for (client_id, drawing) in &self.pane_drawings {
+            if !connected_clients.contains(client_id) {
+                continue;
+            }
+            let Some(area) = drawing.area(&viewport) else {
+                continue;
+            };
+            output.add_character_chunks_to_client(
+                *client_id,
+                mouse_handler::pane_drawing_outline(&area, color),
+                Some(mouse_handler::PANE_DRAWING_Z_INDEX),
+            )?;
+        }
         Ok(())
     }
 
@@ -5468,25 +6186,54 @@ impl Tab {
             self.should_clear_display_before_rendering = false;
         }
     }
-    fn render_cursor(&mut self, output: &mut Output) {
+    fn render_cursor(&mut self, output: &mut Output, use_live_view_cursor: bool) {
         let connected_clients: Vec<ClientId> =
             { self.connected_clients.borrow().iter().copied().collect() };
         for client_id in connected_clients {
-            if self.has_focused_popup_for_client(client_id) {
+            let live_view_cursor = if use_live_view_cursor {
+                self.live_view_cursor(client_id)
+            } else {
+                None
+            };
+            if self.has_focused_popup_for_client(client_id) && live_view_cursor.is_none() {
                 output.set_client_cursor(client_id, 0, 0, false, "");
                 output.add_post_vte_instruction_to_client(client_id, "\u{1b}[?25l");
                 continue;
             }
-            match self.get_active_terminal_cursor_position(client_id) {
+            let cursor_position = match live_view_cursor.as_ref() {
+                Some((x, y, visible, _)) => Some((*x, *y, *visible)),
+                None => self.get_active_terminal_cursor_position(client_id),
+            };
+            match cursor_position {
                 Some((cursor_position_x, cursor_position_y, is_cursor_visible)) => {
                     let active_pane_z_index = self
                         .get_active_pane_id(client_id)
                         .and_then(|pane_id| self.floating_panes.get_pane_z_index(pane_id));
-                    let not_occluded = output.cursor_is_visible(
+                    let not_covered_by_floating_panes = output.cursor_is_visible(
                         cursor_position_x,
                         cursor_position_y,
                         active_pane_z_index,
                     );
+                    let not_occluded = match live_view_cursor.as_ref() {
+                        Some(_) => match self.live_view_popup_z_index(client_id) {
+                            Some(popup_z_index) => !output.cursor_is_covered_by_popups(
+                                client_id,
+                                cursor_position_x,
+                                cursor_position_y,
+                                Some(popup_z_index),
+                            ),
+                            None => {
+                                not_covered_by_floating_panes
+                                    && !output.cursor_is_covered_by_popups(
+                                        client_id,
+                                        cursor_position_x,
+                                        cursor_position_y,
+                                        None,
+                                    )
+                            },
+                        },
+                        None => not_covered_by_floating_panes,
+                    };
                     let active_terminal_is_mid_frame = self
                         .active_terminal_is_mid_frame(client_id)
                         .unwrap_or(false);
@@ -5496,10 +6243,13 @@ impl Tab {
                         // which means the cursor can be jumping around and we definitely do not
                         // want to render it
                     } else if not_occluded && is_cursor_visible {
-                        let desired_cursor_shape = self
-                            .get_active_pane(client_id)
-                            .map(|ap| ap.cursor_shape_csi())
-                            .unwrap_or_default();
+                        let desired_cursor_shape = match live_view_cursor.as_ref() {
+                            Some((_, _, _, shape)) => shape.clone(),
+                            None => self
+                                .get_active_pane(client_id)
+                                .map(|ap| ap.cursor_shape_csi())
+                                .unwrap_or_default(),
+                        };
                         let cursor_changed_position_or_shape = self
                             .cursor_positions_and_shape
                             .get(&client_id)
@@ -5874,6 +6624,15 @@ impl Tab {
             if self.tiled_panes.fullscreen_is_active() {
                 return Ok(self.focus_pane_left_fullscreen(client_id));
             }
+            if self.stacked_pane_list_is_active()
+                && self.move_focus_within_stack_list(
+                    client_id,
+                    false,
+                    StackListOrientation::Horizontal,
+                )
+            {
+                return Ok(true);
+            }
             Ok(self.tiled_panes.move_focus_left(client_id))
         }
     }
@@ -5896,7 +6655,11 @@ impl Tab {
                 return Ok(self.focus_pane_down_fullscreen(client_id));
             }
             if self.stacked_pane_list_is_active()
-                && self.move_focus_within_stack_list(client_id, true)
+                && self.move_focus_within_stack_list(
+                    client_id,
+                    true,
+                    StackListOrientation::Vertical,
+                )
             {
                 return Ok(true);
             }
@@ -5922,7 +6685,11 @@ impl Tab {
                 return Ok(self.focus_pane_up_fullscreen(client_id));
             }
             if self.stacked_pane_list_is_active()
-                && self.move_focus_within_stack_list(client_id, false)
+                && self.move_focus_within_stack_list(
+                    client_id,
+                    false,
+                    StackListOrientation::Vertical,
+                )
             {
                 return Ok(true);
             }
@@ -5947,6 +6714,15 @@ impl Tab {
             }
             if self.tiled_panes.fullscreen_is_active() {
                 return Ok(self.focus_pane_right_fullscreen(client_id));
+            }
+            if self.stacked_pane_list_is_active()
+                && self.move_focus_within_stack_list(
+                    client_id,
+                    true,
+                    StackListOrientation::Horizontal,
+                )
+            {
+                return Ok(true);
             }
             Ok(self.tiled_panes.move_focus_right(client_id))
         }
@@ -6276,6 +7052,100 @@ impl Tab {
     /// back at the size the layout asked for.
     ///
     /// Floating panes take no space from their neighbors, so there is nothing to give back.
+    pub fn bar_pane_ids(&self) -> Vec<PaneId> {
+        let display_area = *self.display_area.borrow();
+        self.tiled_panes
+            .get_panes()
+            .filter(|(pane_id, pane)| {
+                if !matches!(pane_id, PaneId::Plugin(_)) {
+                    return false;
+                }
+                if pane.selectable() && !pane.borderless() {
+                    return false;
+                }
+                let geom = pane.position_and_size();
+                let spans_full_width = geom.x == 0 && geom.cols.as_usize() == display_area.cols;
+                let is_at_top = geom.y == 0;
+                let is_at_bottom = geom.y + geom.rows.as_usize() == display_area.rows;
+                let is_strip = geom.rows.as_usize() < display_area.rows;
+                spans_full_width && is_strip && (is_at_top || is_at_bottom)
+            })
+            .map(|(pane_id, _)| *pane_id)
+            .collect()
+    }
+    pub fn bar_names_of_pane(&self, pane_id: PaneId) -> Option<Vec<String>> {
+        if !self.bar_pane_ids().contains(&pane_id) {
+            return None;
+        }
+        let names = self
+            .tiled_panes
+            .get_pane(pane_id)
+            .and_then(|pane| pane.invoked_with().as_ref().map(|run| run.bar_names()))
+            .unwrap_or_default();
+        Some(names)
+    }
+    pub fn bar_label_of_pane(&self, pane_id: PaneId) -> Option<String> {
+        let names = self.bar_names_of_pane(pane_id)?;
+        if let Some(label) = names.iter().find_map(|name| bar_role_label(name)) {
+            return Some(label.to_owned());
+        }
+        let title = self
+            .tiled_panes
+            .get_pane(pane_id)
+            .map(|pane| pane.current_title())
+            .filter(|title| !title.trim().is_empty() && title.len() <= 30);
+        Some(title.unwrap_or_else(|| "bar".to_owned()))
+    }
+    pub fn apply_hidden_bars(&mut self, hidden_bars: &HiddenBars) -> bool {
+        let hidden_bars_changed = &self.hidden_bars != hidden_bars;
+        self.hidden_bars = hidden_bars.clone();
+        let bar_pane_ids = self.bar_pane_ids();
+        let mut changed = false;
+        for pane_id in self.tiled_panes.hidden_bar_ids() {
+            if !bar_pane_ids.contains(&pane_id) {
+                changed |= self.tiled_panes.set_bar_hidden(pane_id, false);
+            }
+        }
+        for pane_id in bar_pane_ids {
+            let names = self.bar_names_of_pane(pane_id).unwrap_or_default();
+            let should_hide = hidden_bars.hides_any(&names);
+            changed |= self.tiled_panes.set_bar_hidden(pane_id, should_hide);
+        }
+        if changed {
+            let size = self.size;
+            self.resize_whole_tab(size).non_fatal();
+            self.set_force_render();
+        }
+        if changed || hidden_bars_changed {
+            let _ = self.update_input_modes();
+        }
+        changed
+    }
+    pub fn bar_count(&self) -> usize {
+        self.bar_pane_ids().len()
+    }
+    pub fn visible_bar_count(&self) -> usize {
+        self.bar_pane_ids()
+            .into_iter()
+            .filter(|pane_id| {
+                !self.tiled_panes.pane_is_hidden_bar(pane_id)
+                    && !self.tiled_panes.pane_is_collapsed(pane_id)
+            })
+            .count()
+    }
+    pub fn has_hidden_bar(&self) -> bool {
+        !self.tiled_panes.hidden_bar_ids().is_empty()
+    }
+    pub fn mode_is_shown_by_a_visible_bar(&self) -> bool {
+        self.bar_pane_ids().into_iter().any(|pane_id| {
+            !self.tiled_panes.pane_is_hidden_bar(&pane_id)
+                && !self.tiled_panes.pane_is_collapsed(&pane_id)
+                && self
+                    .bar_names_of_pane(pane_id)
+                    .map(|names| names.iter().any(|name| bar_shows_mode(name)))
+                    .unwrap_or(false)
+        })
+    }
     pub fn set_pane_collapsed(&mut self, pane_id: PaneId, collapsed: bool) {
         if !self.tiled_panes.panes_contain(&pane_id) {
             return;
@@ -6716,8 +7586,7 @@ impl Tab {
     ) -> Result<()> {
         let err_context = || format!("failed to edit scrollback for client {client_id}");
 
-        let mut file = temp_dir();
-        file.push(format!("{}.dump", Uuid::new_v4()));
+        let file = private_scrollback_dump_path();
         self.dump_active_terminal_screen(
             Some(String::from(file.to_string_lossy())),
             client_id,
@@ -6743,8 +7612,7 @@ impl Tab {
     ) -> Result<()> {
         let err_context = || format!("failed to edit scrollback for client {client_id}");
 
-        let mut file = temp_dir();
-        file.push(format!("{}.dump", Uuid::new_v4()));
+        let file = private_scrollback_dump_path();
         self.dump_with_ansi_active_terminal_screen(
             Some(String::from(file.to_string_lossy())),
             client_id,
@@ -6770,8 +7638,7 @@ impl Tab {
     ) -> Result<()> {
         if let PaneId::Terminal(_terminal_pane_id) = pane_id {
             self.make_hidden_stack_list_member_visible(pane_id);
-            let mut file = temp_dir();
-            file.push(format!("{}.dump", Uuid::new_v4()));
+            let file = private_scrollback_dump_path();
             self.dump_terminal_screen(Some(String::from(file.to_string_lossy())), pane_id, true)
                 .non_fatal();
             let line_number = self
@@ -6795,8 +7662,7 @@ impl Tab {
     ) -> Result<()> {
         if let PaneId::Terminal(_terminal_pane_id) = pane_id {
             self.make_hidden_stack_list_member_visible(pane_id);
-            let mut file = temp_dir();
-            file.push(format!("{}.dump", Uuid::new_v4()));
+            let file = private_scrollback_dump_path();
             self.dump_with_ansi_terminal_screen(
                 Some(String::from(file.to_string_lossy())),
                 pane_id,
@@ -7189,7 +8055,22 @@ impl Tab {
         passthrough_pane_id: Option<PaneId>,
         mousebinds: Arc<Mousebinds>,
     ) -> Result<MouseEffect> {
+        self.note_local_click(event);
         MouseHandler::handle_mouse_event(self, event, client_id, passthrough_pane_id, mousebinds)
+    }
+
+    fn note_local_click(&mut self, event: &MouseEvent) {
+        let is_click = event.event_type == zellij_utils::input::mouse::MouseEventType::Press
+            && (event.left || event.right || event.middle);
+        if !is_click {
+            return;
+        }
+        if let Ok(Some(pane)) = MouseHandler::get_pane_at(self, &event.position, false) {
+            let pane_id = pane.pid();
+            if let PaneId::Terminal(_) = pane_id {
+                self.local_input.insert(pane_id);
+            }
+        }
     }
 
     pub fn copy_selection(&self, client_id: ClientId) -> Result<()> {
@@ -7264,27 +8145,7 @@ impl Tab {
         Ok(())
     }
     pub fn visible(&mut self, visible: bool) -> Result<()> {
-        // Floating panes must be included here as well: a plugin in a floating pane is just as
-        // hidden as a tiled one when its tab goes away, and plugins that idle on a timer (eg. the
-        // session-manager, which polls the session list once a second) keep that timer armed until
-        // they are told otherwise.
         self.tab_visible = visible;
-        let floating_panes_are_shown = self.floating_panes.panes_are_shown();
-        let tiled_pids = self.tiled_panes.pane_ids().filter_map(|p| match p {
-            PaneId::Plugin(pid) => Some(*pid),
-            _ => None,
-        });
-        let floating_pids = self.floating_panes.pane_ids().filter_map(|p| match p {
-            PaneId::Plugin(pid) if !visible || floating_panes_are_shown => Some(*pid),
-            _ => None,
-        });
-        let mut plugin_updates = vec![];
-        for pid in tiled_pids.chain(floating_pids) {
-            plugin_updates.push((Some(pid), None, Event::Visible(visible)));
-        }
-        self.senders
-            .send_to_plugin(PluginInstruction::Update(plugin_updates))
-            .with_context(|| format!("failed to set visibility of tab to {visible}"))?;
         if !visible {
             self.mouse_hover_pane_id.clear();
             self.plugin_hover_pane_id.clear();
@@ -7565,6 +8426,7 @@ impl Tab {
         &mut self,
         pid: u32,
         loading_indication: LoadingIndication,
+        client_id: Option<ClientId>,
     ) {
         if let Some(plugin_pane) = self
             .tiled_panes
@@ -7577,7 +8439,12 @@ impl Tab {
                     .map(|s_p| &mut s_p.1)
             })
         {
-            plugin_pane.start_loading_indication(loading_indication);
+            match client_id {
+                Some(client_id) => {
+                    plugin_pane.start_loading_indication_for_client(client_id, loading_indication)
+                },
+                None => plugin_pane.start_loading_indication(loading_indication),
+            }
         }
     }
     pub fn progress_plugin_loading_offset(&mut self, pid: u32) {
@@ -7597,49 +8464,53 @@ impl Tab {
     }
     pub fn show_floating_panes(&mut self) {
         // this function is to be preferred to directly invoking floating_panes.toggle_show_panes(true)
-        let were_shown = self.floating_panes.panes_are_shown();
         self.floating_panes.toggle_show_panes(true);
         self.tiled_panes.unfocus_all_panes();
         self.set_force_render();
-        if !were_shown {
-            self.notify_floating_plugins_of_visibility(true);
-        }
     }
 
     pub fn hide_floating_panes(&mut self) {
         // this function is to be preferred to directly invoking
         // floating_panes.toggle_show_panes(false)
-        let were_shown = self.floating_panes.panes_are_shown();
         if self.floating_panes.fullscreen_is_active() {
             self.floating_panes.unset_fullscreen();
         }
         self.floating_panes.toggle_show_panes(false);
         self.tiled_panes.focus_all_panes();
         self.set_force_render();
-        if were_shown {
-            self.notify_floating_plugins_of_visibility(false);
-        }
     }
 
-    fn notify_floating_plugins_of_visibility(&self, visible: bool) {
-        if !self.tab_visible {
-            return;
+    pub fn all_plugin_ids(&self) -> Vec<PluginId> {
+        let mut plugin_ids = self.get_plugin_ids_including_suppressed();
+        for plugin_id in self.all_popup_plugin_ids() {
+            if !plugin_ids.contains(&plugin_id) {
+                plugin_ids.push(plugin_id);
+            }
         }
-        let plugin_updates: Vec<_> = self
-            .floating_panes
-            .pane_ids()
-            .filter_map(|p| match p {
-                PaneId::Plugin(pid) => Some((Some(*pid), None, Event::Visible(visible))),
-                _ => None,
+        plugin_ids
+    }
+
+    pub fn shown_plugin_ids(&self) -> HashSet<PluginId> {
+        let connected_clients: Vec<ClientId> =
+            { self.connected_clients.borrow().iter().copied().collect() };
+        if !self.tab_visible || connected_clients.is_empty() {
+            return HashSet::new();
+        }
+        let mut pane_ids: Vec<PaneId> = self.floating_panes.rendered_pane_ids();
+        if !self.floating_panes.fullscreen_is_active() {
+            pane_ids.extend(self.tiled_panes.rendered_pane_ids());
+        }
+        let mut plugin_ids: HashSet<PluginId> = pane_ids
+            .into_iter()
+            .filter_map(|pane_id| match pane_id {
+                PaneId::Plugin(plugin_id) => Some(plugin_id),
+                PaneId::Terminal(_) => None,
             })
             .collect();
-        if plugin_updates.is_empty() {
-            return;
+        for client_id in connected_clients {
+            plugin_ids.extend(self.popup_plugin_ids_for_client(client_id));
         }
-        self.senders
-            .send_to_plugin(PluginInstruction::Update(plugin_updates))
-            .with_context(|| format!("failed to set visibility of floating panes to {visible}"))
-            .non_fatal();
+        plugin_ids
     }
 
     pub fn show_floating_panes_atomic(&mut self, mut completion: Option<NotificationEnd>) {
@@ -7680,6 +8551,19 @@ impl Tab {
             }
         }
         drop(completion);
+    }
+
+    pub fn floating_plugin_for_location(&self, location: &str) -> Option<u32> {
+        self.floating_panes.get_panes().find_map(|(pane_id, pane)| {
+            match (pane_id, pane.invoked_with()) {
+                (PaneId::Plugin(plugin_id), Some(Run::Plugin(run_plugin_or_alias)))
+                    if run_plugin_or_alias.location_string().contains(location) =>
+                {
+                    Some(*plugin_id)
+                },
+                _ => None,
+            }
+        })
     }
 
     pub fn find_plugin(&self, run_plugin_or_alias: &RunPluginOrAlias) -> Option<PaneId> {
@@ -8305,6 +9189,7 @@ impl Tab {
             if asks_for_permissions {
                 self.reveal_popup(pid);
             }
+            self.set_popup_awaiting_permission(pid, asks_for_permissions);
             self.set_force_render();
             return;
         }
@@ -8343,7 +9228,7 @@ impl Tab {
         &mut self,
         terminal_pane_id: u32,
         completion_tx: Option<NotificationEnd>,
-    ) {
+    ) -> bool {
         let pane_id = PaneId::Terminal(terminal_pane_id);
         match self
             .floating_panes
@@ -8359,8 +9244,10 @@ impl Tab {
                         command_to_rerun,
                         completion_tx,
                     ));
+                    true
                 } else {
-                    log::error!("Pane is still running!")
+                    log::error!("Pane is still running!");
+                    false
                 }
             },
             None => {
@@ -8368,6 +9255,7 @@ impl Tab {
                     "Failed to find terminal pane with id {} to rerun in tab",
                     terminal_pane_id
                 );
+                false
             },
         }
     }
@@ -8532,6 +9420,98 @@ impl Tab {
     }
     pub fn update_grapheme_clusters(&mut self, grapheme_clusters: bool) {
         self.grapheme_clusters = grapheme_clusters;
+    }
+    pub fn set_live_views(&mut self, live_views: crate::pane_mirror::SharedLiveViews) {
+        self.tiled_panes.set_live_views(live_views.clone());
+        self.floating_panes.set_live_views(live_views.clone());
+        self.live_views = live_views;
+    }
+    pub fn live_view_focus(&self, client_id: ClientId) -> Option<PaneId> {
+        if let Some(plugin_id) = self.popup_plugin_id(client_id) {
+            return Some(PaneId::Plugin(plugin_id));
+        }
+        if self.floating_panes.panes_are_visible() {
+            self.floating_panes
+                .get_active_pane_id(client_id)
+                .or_else(|| self.tiled_panes.get_active_pane_id(client_id))
+        } else {
+            self.tiled_panes.get_active_pane_id(client_id)
+        }
+    }
+    pub fn live_view_content_area(
+        &self,
+        plugin_id: u32,
+    ) -> Option<crate::pane_mirror::LiveViewRect> {
+        let pane_id = PaneId::Plugin(plugin_id);
+        let pane = self
+            .get_pane_with_id(pane_id)
+            .or_else(|| self.popup_pane(plugin_id))?;
+        Some(crate::pane_mirror::LiveViewRect::new(
+            pane.get_content_x(),
+            pane.get_content_y(),
+            pane.get_content_columns(),
+            pane.get_content_rows(),
+        ))
+    }
+    pub fn mark_plugin_pane_for_full_render(&mut self, plugin_id: u32) {
+        let pane_id = PaneId::Plugin(plugin_id);
+        let pane = match self.get_pane_with_id_mut(pane_id) {
+            Some(pane) => Some(pane),
+            None => self.popup_pane_mut(plugin_id),
+        };
+        if let Some(pane) = pane {
+            pane.set_should_render(true);
+            pane.render_full_viewport();
+        }
+    }
+    pub fn live_view_point_is_covered(
+        &self,
+        client_id: ClientId,
+        plugin_id: u32,
+        position: &Position,
+    ) -> bool {
+        let popups = self.popup_geoms(client_id);
+        if let Some(layer) = self.popup_layer_of(client_id, plugin_id) {
+            return popups
+                .iter()
+                .skip(layer + 1)
+                .any(|geom| geom.contains(position));
+        }
+        if popups.iter().any(|geom| geom.contains(position)) {
+            return true;
+        }
+        let Some(stack) = self.floating_panes.stack() else {
+            return false;
+        };
+        let pane_id = PaneId::Plugin(plugin_id);
+        let first_layer_above = if self.floating_panes.panes_are_visible() {
+            self.floating_panes
+                .get_pane_z_index(pane_id)
+                .map(|z_index| z_index + 1)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        stack
+            .layers
+            .iter()
+            .skip(first_layer_above)
+            .any(|geom| geom.contains(position))
+    }
+    fn live_view_popup_z_index(&self, client_id: ClientId) -> Option<usize> {
+        match self.live_view_focus(client_id)? {
+            PaneId::Plugin(plugin_id) => self.popup_z_index_of(client_id, plugin_id),
+            PaneId::Terminal(_) => None,
+        }
+    }
+    fn live_view_cursor(&self, client_id: ClientId) -> Option<(usize, usize, bool, String)> {
+        let PaneId::Plugin(plugin_id) = self.live_view_focus(client_id)? else {
+            return None;
+        };
+        let content = self.live_view_content_area(plugin_id)?;
+        self.live_views
+            .borrow()
+            .cursor(client_id, plugin_id, &content)
     }
     pub fn update_selection_options(
         &mut self,
@@ -9036,6 +10016,40 @@ impl Tab {
         if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
             pane.toggle_pinned();
             self.set_force_render();
+        }
+    }
+}
+
+fn private_scrollback_dump_path() -> PathBuf {
+    let mut file = temp_dir();
+    file.push(format!("{}.dump", Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Err(e) = options.open(&file) {
+        log::warn!("failed to create scrollback dump file {:?}: {}", file, e);
+    }
+    file
+}
+
+fn without_paste_markers(mut bytes: Vec<u8>) -> Vec<u8> {
+    const MARKERS: [&[u8]; 2] = [b"\x1b[200~", b"\x1b[201~"];
+    loop {
+        let found = MARKERS.iter().find_map(|marker| {
+            bytes
+                .windows(marker.len())
+                .position(|window| window == *marker)
+                .map(|start| (start, marker.len()))
+        });
+        match found {
+            Some((start, len)) => {
+                bytes.drain(start..start + len);
+            },
+            None => return bytes,
         }
     }
 }

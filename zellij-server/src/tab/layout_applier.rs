@@ -20,7 +20,7 @@ use std::rc::Rc;
 use zellij_utils::{
     data::{Palette, Style},
     input::layout::{FloatingPaneLayout, Run, RunPluginOrAlias, TiledPaneLayout},
-    input::options::PaneFrameStyle,
+    input::options::{PaneFrameStyle, StackListOrientation},
     pane_size::{Offset, PaneGeom, Size, SizeInPixels, Viewport},
 };
 
@@ -125,7 +125,7 @@ impl<'a> LayoutApplier<'a> {
         new_floating_terminal_ids: Vec<(u32, HoldForCommand)>,
         mut new_plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
         client_id: ClientId,
-    ) -> Result<bool> {
+    ) -> Result<(bool, HashMap<usize, StackListOrientation>)> {
         // true => should_show_floating_panes
         let hide_floating_panes = layout.hide_floating_panes;
         let result = self
@@ -135,12 +135,13 @@ impl<'a> LayoutApplier<'a> {
                 &mut new_plugin_ids,
                 client_id,
             )
-            .and_then(|_| {
+            .and_then(|stack_orientations| {
                 self.apply_floating_panes_layout(
                     floating_panes_layout,
                     new_floating_terminal_ids.clone(),
                     &mut new_plugin_ids,
                 )
+                .map(|has_floating_panes| (has_floating_panes, stack_orientations))
             });
         if result.is_err() {
             self.close_unused_floating_terminal_ids(
@@ -154,9 +155,9 @@ impl<'a> LayoutApplier<'a> {
             );
         }
         self.unload_unused_plugin_ids(&new_plugin_ids);
-        let layout_has_floating_panes = result?;
+        let (layout_has_floating_panes, stack_orientations) = result?;
         let should_show_floating_panes = layout_has_floating_panes && !hide_floating_panes;
-        return Ok(should_show_floating_panes);
+        return Ok((should_show_floating_panes, stack_orientations));
     }
     pub fn override_layout(
         &mut self,
@@ -168,7 +169,7 @@ impl<'a> LayoutApplier<'a> {
         retain_existing_terminal_panes: bool,
         retain_existing_plugin_panes: bool,
         client_id: ClientId,
-    ) -> Result<bool> {
+    ) -> Result<(bool, HashMap<usize, StackListOrientation>)> {
         // true => should_show_floating_panes
         let hide_floating_panes = tiled_panes_layout.hide_floating_panes;
         let result = self
@@ -180,7 +181,7 @@ impl<'a> LayoutApplier<'a> {
                 retain_existing_plugin_panes,
                 client_id,
             )
-            .and_then(|_| {
+            .and_then(|stack_orientations| {
                 self.override_floating_panes_layout_for_existing_panes(
                     &floating_panes_layout,
                     new_floating_terminal_ids.clone(),
@@ -188,6 +189,7 @@ impl<'a> LayoutApplier<'a> {
                     retain_existing_terminal_panes,
                     retain_existing_plugin_panes,
                 )
+                .map(|has_floating_panes| (has_floating_panes, stack_orientations))
             });
         if result.is_err() {
             self.close_unused_floating_terminal_ids(
@@ -197,15 +199,15 @@ impl<'a> LayoutApplier<'a> {
             );
         }
         self.unload_unused_plugin_ids(&new_plugin_ids);
-        let layout_has_floating_panes = result?;
+        let (layout_has_floating_panes, stack_orientations) = result?;
         let should_show_floating_panes = layout_has_floating_panes && !hide_floating_panes;
-        return Ok(should_show_floating_panes);
+        return Ok((should_show_floating_panes, stack_orientations));
     }
     pub fn apply_tiled_panes_layout_to_existing_panes(
         &mut self,
         layout: &TiledPaneLayout,
-    ) -> Result<bool> {
-        let positions_in_layout = self.flatten_layout(layout, true)?;
+    ) -> Result<(bool, HashMap<usize, StackListOrientation>)> {
+        let (positions_in_layout, stack_orientations) = self.flatten_layout(layout, true)?;
 
         let mut existing_tab_state = ExistingTabState::new(self.tiled_panes.drain());
 
@@ -267,7 +269,7 @@ impl<'a> LayoutApplier<'a> {
             self.tiled_panes,
             self.pane_frame_style,
         );
-        Ok(panes_were_floated)
+        Ok((panes_were_floated, stack_orientations))
     }
     pub fn override_tiled_panes_layout_for_existing_panes(
         &mut self,
@@ -277,8 +279,9 @@ impl<'a> LayoutApplier<'a> {
         retain_existing_terminal_panes: bool,
         retain_existing_plugin_panes: bool,
         client_id: ClientId,
-    ) -> Result<()> {
-        let positions_in_layout = self.flatten_layout(tiled_panes_layout, false)?;
+    ) -> Result<HashMap<usize, StackListOrientation>> {
+        let (positions_in_layout, stack_orientations) =
+            self.flatten_layout(tiled_panes_layout, false)?;
 
         let mut existing_tab_state = ExistingTabState::new(self.tiled_panes.drain());
 
@@ -367,7 +370,7 @@ impl<'a> LayoutApplier<'a> {
             self.tiled_panes,
             self.pane_frame_style,
         );
-        Ok(())
+        Ok(stack_orientations)
     }
     fn close_non_retained_panes(
         &self,
@@ -402,7 +405,10 @@ impl<'a> LayoutApplier<'a> {
         &self,
         layout: &TiledPaneLayout,
         has_existing_panes: bool,
-    ) -> Result<Vec<(TiledPaneLayout, PaneGeom)>> {
+    ) -> Result<(
+        Vec<(TiledPaneLayout, PaneGeom)>,
+        HashMap<usize, StackListOrientation>,
+    )> {
         let free_space = self.total_space_for_tiled_panes();
         let tiled_panes_count = if has_existing_panes {
             Some(self.tiled_panes.visible_panes_count())
@@ -410,12 +416,14 @@ impl<'a> LayoutApplier<'a> {
             None
         };
         let focus_layout_if_not_focused = if has_existing_panes { false } else { true };
+        let mut stack_orientations = HashMap::new();
         let mut positions_in_layout = layout
             .position_panes_in_space(
                 &free_space,
                 tiled_panes_count,
                 false,
                 focus_layout_if_not_focused,
+                &mut stack_orientations,
             )
             .or_else(|_e| {
                 // in the error branch, we try to recover by positioning the panes in the space but
@@ -427,6 +435,7 @@ impl<'a> LayoutApplier<'a> {
                     tiled_panes_count,
                     true,
                     focus_layout_if_not_focused,
+                    &mut stack_orientations,
                 )
             })
             .map_err(|e| anyhow!(e))?;
@@ -435,7 +444,7 @@ impl<'a> LayoutApplier<'a> {
             position_and_size.logical_position = Some(logical_position);
             logical_position += 1;
         }
-        Ok(positions_in_layout)
+        Ok((positions_in_layout, stack_orientations))
     }
     fn apply_tiled_panes_layout(
         &mut self,
@@ -443,9 +452,9 @@ impl<'a> LayoutApplier<'a> {
         mut new_terminal_ids: Vec<(u32, HoldForCommand)>,
         mut new_plugin_ids: &mut HashMap<RunPluginOrAlias, Vec<u32>>,
         client_id: ClientId,
-    ) -> Result<()> {
+    ) -> Result<HashMap<usize, StackListOrientation>> {
         let err_context = || format!("failed to apply tiled panes layout");
-        let mut positions_in_layout = self.flatten_layout(&layout, false)?;
+        let (mut positions_in_layout, stack_orientations) = self.flatten_layout(&layout, false)?;
         let run_instructions_without_a_location = self.position_run_instructions_to_ignore(
             &layout.run_instructions_to_ignore,
             &mut positions_in_layout,
@@ -466,7 +475,7 @@ impl<'a> LayoutApplier<'a> {
 
         self.adjust_viewport().with_context(err_context)?;
         self.set_focused_tiled_pane(focus_pane_id, client_id);
-        Ok(())
+        Ok(stack_orientations)
     }
     fn position_run_instructions_to_ignore(
         &mut self,
@@ -723,6 +732,14 @@ impl<'a> LayoutApplier<'a> {
                 floating_pane_layout.default_bg.clone(),
             );
         }
+        if floating_pane_layout.attention_muted.is_some()
+            || floating_pane_layout.ignore_output.is_some()
+        {
+            new_pane.set_initial_attention_flags(
+                floating_pane_layout.attention_muted.unwrap_or(false),
+                floating_pane_layout.ignore_output.unwrap_or(false),
+            );
+        }
         if let Some(held_command) = hold_for_command {
             new_pane.hold(None, true, held_command.clone());
         }
@@ -798,6 +815,12 @@ impl<'a> LayoutApplier<'a> {
         }
         if layout.default_fg.is_some() || layout.default_bg.is_some() {
             new_pane.set_pane_default_colors(layout.default_fg.clone(), layout.default_bg.clone());
+        }
+        if layout.attention_muted.is_some() || layout.ignore_output.is_some() {
+            new_pane.set_initial_attention_flags(
+                layout.attention_muted.unwrap_or(false),
+                layout.ignore_output.unwrap_or(false),
+            );
         }
         if let Some(held_command) = hold_for_command {
             new_pane.hold(None, true, held_command.clone());
@@ -1304,7 +1327,7 @@ impl ExistingTabState {
     ) -> Option<Box<dyn Pane>> {
         let candidates = self.pane_candidates();
         let pane_id = candidates.iter().find_map(|(_pid, p)| {
-            if p.invoked_with() == run {
+            if Run::fills_same_layout_slot(p.invoked_with(), run) {
                 Some(p.pid())
             } else {
                 None
@@ -1375,7 +1398,7 @@ impl ExistingTabState {
         }
         let panes_with_same_contents = candidates
             .iter()
-            .filter(|(_pid, p)| p.invoked_with() == run)
+            .filter(|(_pid, p)| Run::fills_same_layout_slot(p.invoked_with(), run))
             .collect::<Vec<_>>();
         if panes_with_same_contents.len() > 1 {
             panes_with_same_contents

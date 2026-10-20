@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 use crate::{
     data::{BorderStyleOverride, LineStyle},
-    input::layout::PluginUserConfiguration,
     input::layout::{
         FloatingPaneLayout, Layout, LayoutConstraint, PercentOrFixed, Run, RunPluginOrAlias,
         SplitDirection, SplitSize, SwapFloatingLayout, SwapTiledLayout, TiledPaneLayout,
     },
+    input::{layout::PluginUserConfiguration, options::StackListOrientation},
     pane_size::{Constraint, PaneGeom},
 };
 
@@ -18,6 +18,7 @@ pub struct GlobalLayoutManifest {
     pub default_shell: Option<PathBuf>,
     pub default_layout: Box<Layout>,
     pub tabs: Vec<(String, TabLayoutManifest)>,
+    pub session_attention_muted: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -26,11 +27,13 @@ pub struct TabLayoutManifest {
     pub floating_panes: Vec<PaneLayoutManifest>,
     pub is_focused: bool,
     pub hide_floating_panes: bool,
+    pub attention_muted: bool,
 }
 
 #[derive(Default, Debug, Clone)]
 pub struct PaneLayoutManifest {
     pub geom: PaneGeom,
+    pub stack_orientation: Option<StackListOrientation>,
     pub run: Option<Run>,
     pub cwd: Option<PathBuf>,
     pub is_borderless: bool,
@@ -40,6 +43,8 @@ pub struct PaneLayoutManifest {
     pub default_fg: Option<String>,
     pub default_bg: Option<String>,
     pub border_style: Option<BorderStyleOverride>,
+    pub attention_muted: bool,
+    pub ignore_output: bool,
 }
 
 pub fn serialize_session_layout(
@@ -50,6 +55,12 @@ pub fn serialize_session_layout(
     let mut pane_contents = BTreeMap::new();
     let mut layout_node = KdlNode::new("layout");
     let mut layout_node_children = KdlDocument::new();
+    if global_layout_manifest.session_attention_muted {
+        layout_node.entries_mut().push(KdlEntry::new_prop(
+            "session_attention_muted",
+            KdlValue::Bool(true),
+        ));
+    }
     if let Some(global_cwd) = serialize_global_cwd(&global_layout_manifest.global_cwd) {
         layout_node_children.nodes_mut().push(global_cwd);
     }
@@ -88,6 +99,7 @@ fn serialize_tab(
     tab_name: String,
     is_focused: bool,
     hide_floating_panes: bool,
+    attention_muted: bool,
     tiled_panes: &Vec<PaneLayoutManifest>,
     floating_panes: &Vec<PaneLayoutManifest>,
     pane_contents: &mut BTreeMap<String, String>,
@@ -111,6 +123,11 @@ fn serialize_tab(
                     "hide_floating_panes",
                     KdlValue::Bool(true),
                 ));
+            }
+            if attention_muted {
+                serialized_tab
+                    .entries_mut()
+                    .push(KdlEntry::new_prop("attention_muted", KdlValue::Bool(true)));
             }
 
             serialize_tiled_and_floating_panes(
@@ -143,6 +160,7 @@ fn flatten_nested_stacks(mut layout: TiledPaneLayout) -> TiledPaneLayout {
         let only_child = layout.children.remove(0);
         layout.children = only_child.children;
         layout.external_children_index = only_child.external_children_index;
+        layout.stack_orientation = layout.stack_orientation.or(only_child.stack_orientation);
     }
     if layout.children_are_stacked && layout.children.iter().any(|c| !c.children.is_empty()) {
         layout.children_are_stacked = false;
@@ -228,6 +246,11 @@ fn serialize_tiled_pane(
             .entries_mut()
             .push(KdlEntry::new_prop("default_bg", bg.to_owned()));
     }
+    serialize_attention_flags(
+        layout.attention_muted,
+        layout.ignore_output,
+        &mut tiled_pane_node,
+    );
     let has_child_attributes = !layout.children.is_empty()
         || layout.external_children_index.is_some()
         || !args.is_empty()
@@ -425,6 +448,12 @@ fn serialize_tiled_layout_attributes(
         kdl_node
             .entries_mut()
             .push(KdlEntry::new_prop("stacked", KdlValue::Bool(true)));
+        if let Some(direction) = layout.stack_orientation {
+            kdl_node.entries_mut().push(KdlEntry::new_prop(
+                "stack_orientation",
+                direction.to_string(),
+            ));
+        }
     }
     if layout.is_expanded_in_stack && is_in_stack {
         kdl_node
@@ -702,6 +731,7 @@ fn serialize_multiple_tabs(
             tab_name.clone(),
             tab_layout_manifest.is_focused,
             hide_floating_panes,
+            tab_layout_manifest.attention_muted,
             &tiled_panes,
             &floating_panes,
             pane_contents,
@@ -747,6 +777,11 @@ fn serialize_floating_pane(
             .entries_mut()
             .push(KdlEntry::new_prop("default_bg", bg.to_owned()));
     }
+    serialize_attention_flags(
+        layout.attention_muted,
+        layout.ignore_output,
+        &mut floating_pane_node,
+    );
     serialize_start_suspended(&command, &mut floating_pane_node_children);
     serialize_floating_layout_attributes(&layout, &mut floating_pane_node_children);
     serialize_args(args, &mut floating_pane_node_children);
@@ -778,6 +813,7 @@ fn stack_layout_from_manifest(
                 .map(|p| tiled_pane_layout_from_manifest(Some(p), None))
                 .collect(),
             children_are_stacked: true,
+            stack_orientation: stacked_panes.iter().find_map(|pane| pane.stack_orientation),
             ..Default::default()
         })
     }
@@ -791,6 +827,21 @@ fn stack_layout_from_manifest(
             children: stack_nodes,
             ..Default::default()
         })
+    }
+}
+
+fn serialize_attention_flags(
+    attention_muted: Option<bool>,
+    ignore_output: Option<bool>,
+    node: &mut KdlNode,
+) {
+    if attention_muted == Some(true) {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("attention_muted", KdlValue::Bool(true)));
+    }
+    if ignore_output == Some(true) {
+        node.entries_mut()
+            .push(KdlEntry::new_prop("ignore_output", KdlValue::Bool(true)));
     }
 }
 
@@ -808,6 +859,8 @@ fn tiled_pane_layout_from_manifest(
         default_fg,
         default_bg,
         border_style,
+        attention_muted,
+        ignore_output,
     ) = manifest
         .map(|g| {
             let mut run = g.run.clone();
@@ -828,9 +881,13 @@ fn tiled_pane_layout_from_manifest(
                 g.default_fg.clone(),
                 g.default_bg.clone(),
                 g.border_style,
+                g.attention_muted.then_some(true),
+                g.ignore_output.then_some(true),
             )
         })
-        .unwrap_or((None, None, false, None, None, None, None, None, None));
+        .unwrap_or((
+            None, None, false, None, None, None, None, None, None, None, None,
+        ));
     TiledPaneLayout {
         split_size,
         run,
@@ -842,6 +899,8 @@ fn tiled_pane_layout_from_manifest(
         default_fg,
         default_bg,
         border_style,
+        attention_muted,
+        ignore_output,
         ..Default::default()
     }
 }
@@ -913,6 +972,11 @@ fn get_tiled_panes_layout_from_panegeoms(
         split_size,
         children,
         children_are_stacked,
+        stack_orientation: if children_are_stacked {
+            geoms.iter().find_map(|pane| pane.stack_orientation)
+        } else {
+            None
+        },
         ..Default::default()
     })
 }
@@ -953,6 +1017,8 @@ fn get_floating_panes_layout_from_panegeoms(
                 default_fg: m.default_fg.clone(),
                 default_bg: m.default_bg.clone(),
                 border_style: m.border_style,
+                attention_muted: m.attention_muted.then_some(true),
+                ignore_output: m.ignore_output.then_some(true),
             }
         })
         .collect()
@@ -2592,6 +2658,55 @@ mod tests {
     }
 
     #[test]
+    fn stack_orientations_survive_a_round_trip() {
+        for direction in [
+            StackListOrientation::Horizontal,
+            StackListOrientation::Vertical,
+        ] {
+            let panes = [
+                round_trip_geom(0, 0, Dimension::fixed(1), Dimension::fixed(10)),
+                round_trip_geom(0, 1, Dimension::fixed(10), Dimension::fixed(10)),
+            ]
+            .into_iter()
+            .map(|mut geom| {
+                geom.stacked = Some(0);
+                PaneLayoutManifest {
+                    geom,
+                    stack_orientation: Some(direction),
+                    ..Default::default()
+                }
+            })
+            .collect();
+            let manifest = GlobalLayoutManifest {
+                tabs: vec![(
+                    "stack".to_owned(),
+                    TabLayoutManifest {
+                        tiled_panes: panes,
+                        ..Default::default()
+                    },
+                )],
+                ..Default::default()
+            };
+            let (kdl, layout) = serialize_and_parse(manifest);
+            assert!(
+                kdl.contains(&format!("stack_orientation=\"{}\"", direction)),
+                "{}",
+                kdl
+            );
+            let mut directions = HashMap::new();
+            let mut space =
+                round_trip_geom(0, 0, Dimension::percent(100.0), Dimension::percent(100.0));
+            space.rows.set_inner(20);
+            space.cols.set_inner(20);
+            layout.tabs[0]
+                .1
+                .position_panes_in_space(&space, None, false, true, &mut directions)
+                .unwrap();
+            assert_eq!(directions.get(&0), Some(&direction));
+        }
+    }
+
+    #[test]
     fn dollar_signs_in_paths_survive_a_round_trip() {
         use crate::input::command::RunCommand;
         let pane_cwd = PathBuf::from("/tmp/routes/$programId+");
@@ -2638,7 +2753,7 @@ mod tests {
         let default_layout = crate::input::layout::Layout::from_kdl(
             r#"
             layout {
-                pane_template name="stack" stacked=true {
+                pane_template name="stack" stacked=true stack_orientation="horizontal" {
                     children
                 }
                 stack {
@@ -2669,8 +2784,52 @@ mod tests {
         let (template_tiled, _) = layout.template.unwrap();
         let stack = &template_tiled.children[0];
         assert!(stack.children_are_stacked, "{}", kdl);
+        assert_eq!(
+            stack.stack_orientation,
+            Some(StackListOrientation::Horizontal)
+        );
+        assert_eq!(
+            kdl.matches("stack_orientation=\"horizontal\"").count(),
+            2,
+            "{}",
+            kdl
+        );
         assert_eq!(stack.children.len(), 2, "{}", kdl);
         assert!(stack.children.iter().all(|c| c.children.is_empty()));
+    }
+
+    #[test]
+    fn session_and_tab_attention_mute_survive_a_round_trip() {
+        let tab = |attention_muted: bool| TabLayoutManifest {
+            tiled_panes: vec![PaneLayoutManifest {
+                geom: round_trip_geom(0, 0, Dimension::fixed(10), Dimension::fixed(10)),
+                ..Default::default()
+            }],
+            attention_muted,
+            ..Default::default()
+        };
+        let global_layout_manifest = GlobalLayoutManifest {
+            tabs: vec![
+                ("muted".to_owned(), tab(true)),
+                ("unmuted".to_owned(), tab(false)),
+            ],
+            session_attention_muted: true,
+            ..Default::default()
+        };
+        let (kdl, layout) = serialize_and_parse(global_layout_manifest);
+        assert!(kdl.contains("session_attention_muted=true"), "{}", kdl);
+        assert!(layout.session_attention_muted, "{}", kdl);
+        assert_eq!(layout.tabs.len(), 2, "{}", kdl);
+        assert_eq!(layout.tabs[0].1.attention_muted, Some(true), "{}", kdl);
+        assert_eq!(layout.tabs[1].1.attention_muted, None, "{}", kdl);
+
+        let global_layout_manifest = GlobalLayoutManifest {
+            tabs: vec![("unmuted".to_owned(), tab(false))],
+            ..Default::default()
+        };
+        let (kdl, layout) = serialize_and_parse(global_layout_manifest);
+        assert!(!kdl.contains("session_attention_muted"), "{}", kdl);
+        assert!(!layout.session_attention_muted, "{}", kdl);
     }
 
     #[test]

@@ -403,6 +403,8 @@ fn pipe_action(
         plugin_title: None,
         popup,
         popup_no_focus: false,
+        popup_capture_all_keys: false,
+        popup_outside_click: None,
     }
 }
 
@@ -422,6 +424,61 @@ fn pipe_to_the_prompt_plugin_keeps_its_exit_codes() {
     wait_for_prompt_showing(&zellij, "Piped question?");
     zellij.send_stdin(&keys::ESC);
     assert_eq!(pipe.wait_for_exit().exit_code, 1);
+    zellij.quit();
+}
+
+const CLICK_OUTSIDE_THE_POPUP: &[u8] = b"\x1b[<0;3;3M\x1b[<0;3;3m";
+
+fn start_with_mouse_and_terminal() -> (TestSession, FakePtyHandle) {
+    let zellij = TestRunner::new(TERMINAL_SIZE)
+        .with_config("mouse_mode true")
+        .start();
+    let terminal = claim_first_terminal_and_wait_for_prompt(&zellij);
+    (zellij, terminal)
+}
+
+#[test]
+fn a_click_outside_a_prompt_cancels_it_only_with_outside_click_close() {
+    let (mut zellij, terminal) = start_with_mouse_and_terminal();
+    let prompt = zellij.run_prompt(&["choose", "kept-item"], from(&terminal));
+    wait_for_prompt_showing(&zellij, "kept-item");
+    zellij.send_stdin(CLICK_OUTSIDE_THE_POPUP);
+    zellij.send_stdin(&keys::ENTER);
+    answered(&prompt.wait_for_exit(), 0, "kept-item\n");
+    wait_for_prompts_to_close(&zellij);
+    let prompt = zellij.run_prompt(
+        &["choose", "dropped-item", "--outside-click", "close"],
+        from(&terminal),
+    );
+    wait_for_prompt_showing(&zellij, "dropped-item");
+    zellij.send_stdin(CLICK_OUTSIDE_THE_POPUP);
+    answered(&prompt.wait_for_exit(), 1, "");
+    wait_for_prompts_to_close(&zellij);
+    zellij.quit();
+}
+
+#[test]
+fn a_click_outside_a_pipe_popup_closes_it_with_popup_outside_click_close() {
+    let (mut zellij, terminal) = start_with_mouse_and_terminal();
+    let mut action = pipe_action(
+        "confirm",
+        None,
+        Some("zellij:prompt"),
+        Some("message=Piped question?"),
+        Some(PipePopupPlacement::Center),
+    );
+    if let CliAction::Pipe {
+        popup_outside_click,
+        ..
+    } = &mut action
+    {
+        *popup_outside_click = Some(zellij_utils::data::OutsideClick::Close);
+    }
+    let pipe = zellij.run_cli_pipe(action, from(&terminal));
+    wait_for_prompt_showing(&zellij, "Piped question?");
+    zellij.send_stdin(CLICK_OUTSIDE_THE_POPUP);
+    assert_eq!(pipe.wait_for_exit().exit_code, 1);
+    wait_for_prompts_to_close(&zellij);
     zellij.quit();
 }
 
@@ -1002,6 +1059,9 @@ fn lines_containing(grid_snapshot: &GridSnapshot, needle: &str) -> usize {
 fn the_pane_name_sits_one_line_below_the_text_and_can_be_left_out() {
     let (mut zellij, terminal) = start_with_terminal();
     rename_pane(&zellij, &terminal, "SENDER-PANE");
+    zellij.wait_until("the renamed pane is drawn", |grid_snapshot| {
+        grid_snapshot.contains("SENDER-PANE")
+    });
     let notice = zellij.run_prompt(&["notify", "With sender"], from(&terminal));
     answered(&notice.wait_for_exit(), 0, "");
     let grid_snapshot = zellij.wait_until("notice with the pane name shown", |grid_snapshot| {
@@ -1020,7 +1080,6 @@ fn the_pane_name_sits_one_line_below_the_text_and_can_be_left_out() {
         "same tab, so no tab line"
     );
     assert!(!grid_snapshot.contains("from: "));
-    let pane_name_lines_before = lines_containing(&grid_snapshot, "SENDER-PANE");
 
     let notice = zellij.run_prompt(
         &["notify", "No sender", "--no-pane-name", "--at", "top-left"],
@@ -1030,10 +1089,20 @@ fn the_pane_name_sits_one_line_below_the_text_and_can_be_left_out() {
     let grid_snapshot = zellij.wait_until("second notice shown", |grid_snapshot| {
         grid_snapshot.contains("No sender")
     });
-    assert_eq!(
-        lines_containing(&grid_snapshot, "SENDER-PANE"),
-        pane_name_lines_before
-    );
+    let (text_row, text_column) = column_of(&grid_snapshot, "No sender").unwrap();
+    let lines = grid_snapshot.lines();
+    for row in text_row + 1..(text_row + 3).min(lines.len()) {
+        let below: String = lines[row]
+            .chars()
+            .skip(text_column.saturating_sub(2))
+            .take("No sender".len() + 4)
+            .collect();
+        assert!(
+            !below.contains("SENDER"),
+            "the pane name was not left out:\n{}",
+            lines.join("\n")
+        );
+    }
     zellij.quit();
 }
 

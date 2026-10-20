@@ -4,9 +4,9 @@ use super::super::options::{
     Clipboard, HostNotificationProtocol, NestedSessionHandling, OnForceClose, Options,
     PaneFrameStyle,
 };
+use super::super::terminal::TerminalConfig;
 use super::super::theme::{FrameConfig, UiConfig};
 use super::super::web_client::{CursorInactiveStyle, CursorStyle, WebClientConfig};
-use super::super::window::WindowConfig;
 use crate::data::{
     BorderStyleOverride, InputMode, LineStyle, SettingKey, SettingSection, ThemeHue, WebSharing,
 };
@@ -55,10 +55,15 @@ fn every_option_set() -> Options {
         support_kitty_keyboard_protocol: Some(false),
         support_kitty_graphics_protocol: Some(false),
         grapheme_clusters: Some(false),
+        mirror_resizes_source_pane: Some(false),
+        live_view_release_key: Some("Ctrl Alt End".to_owned()),
         web_server: Some(true),
         web_sharing: Some(WebSharing::Disabled),
         stacked_resize: Some(false),
         stacked_pane_list: Some(false),
+        stacked_pane_list_orientation: Some(
+            crate::input::options::StackListOrientation::Horizontal,
+        ),
         show_startup_tips: Some(false),
         show_release_notes: Some(false),
         advanced_mouse_actions: Some(false),
@@ -83,10 +88,12 @@ fn every_option_set() -> Options {
         client_async_worker_tasks: Some(8),
         nested_session_handling: Some(NestedSessionHandling::Never),
         dangerously_enable_paste_buffer_read: Some(true),
-        session_card: Some(false),
         session_indicator: Some(false),
         swap_layout_notification: Some(false),
         on_quit: Some(crate::input::options::OnQuit::Detach),
+        bars_hidden_on_start: Some(crate::data::HiddenBars::from_names(&["tab-bar"])),
+        hidden_bars_notification: Some(false),
+        mode_hints_when_bars_hidden: Some(false),
     }
 }
 
@@ -140,8 +147,11 @@ context_menu {
 }
 ";
 
-const EVERY_WINDOW_SETTING_SET: &str = "window {
+const EVERY_WINDOW_SETTING_SET: &str = "terminal {
     font \"Iosevka Term\"
+    font_bold \"Iosevka Term Bold\"
+    font_italic \"Iosevka Term Italic\"
+    font_bold_italic \"Iosevka Term Bold Italic\"
     font_size 13.5
     font_weight 500
     system_fonts false
@@ -151,11 +161,14 @@ const EVERY_WINDOW_SETTING_SET: &str = "window {
     cursor_blink false
     cursor_unfocused_hollow false
     startup_mode \"maximized\"
+    terminal_requests \"existing_session\"
     initial_columns 120
     initial_rows 40
     opacity 0.9
     opacity_mode \"everything\"
     blur true
+    window_decorations false
+    titlebar_theme \"dark\"
     padding 4
     padding_top 2.5
     padding_right 3
@@ -174,11 +187,12 @@ const EVERY_WINDOW_SETTING_SET: &str = "window {
     scroll_momentum false
     scroll_momentum_friction 4.5
     bell \"both\"
-    notifications \"attention\"
     open_links false
     open_links_with_shift false
     shift_drag_selects false
+    reuse_session_windows false
     middle_click_paste false
+    allow_remote_clipboard_read true
     hide_pointer_while_typing true
     macos_option_as_alt \"both\"
     paste_keys \"Ctrl Shift v\" \"Shift Insert\"
@@ -211,9 +225,9 @@ const EVERY_WINDOW_SETTING_SET: &str = "window {
 }
 ";
 
-pub(crate) fn every_window_setting_set() -> WindowConfig {
+pub(crate) fn every_window_setting_set() -> TerminalConfig {
     let document: KdlDocument = EVERY_WINDOW_SETTING_SET.parse().unwrap();
-    WindowConfig::from_kdl(document.get("window").unwrap()).unwrap()
+    TerminalConfig::from_kdl(document.get("terminal").unwrap()).unwrap()
 }
 
 pub(crate) fn every_setting_set() -> Config {
@@ -250,7 +264,43 @@ pub(crate) fn every_setting_set() -> Config {
             base_url: Some("/zellij".to_owned()),
             font_size: Some(14),
         },
-        window: every_window_setting_set(),
+        terminal: every_window_setting_set(),
+        attention: crate::input::attention::AttentionConfig {
+            frame_markers: Some(false),
+            host_status: Some(false),
+            tab_markers: Some(false),
+            idle_rule: Some(crate::input::attention::IdleRuleScope::Watched),
+            done_threshold_secs: Some(30),
+            track_commands: Some(false),
+            idle_activity_secs: Some(20),
+            idle_silence_secs: Some(5),
+            startup_card: Some(crate::input::attention::StartupCard::Never),
+            tray_icon: Some(false),
+            enabled: Some(false),
+            desktop_notifications: crate::input::attention::StatusMap {
+                needs_you: Some(true),
+                failed: Some(false),
+                done: Some(true),
+                ..Default::default()
+            },
+            tray_badge: crate::input::attention::StatusMap {
+                needs_you: Some(true),
+                failed: Some(true),
+                done: Some(false),
+                working: Some(false),
+                quiet: Some(true),
+                new_output: Some(true),
+            },
+            tray_badge_colors: crate::input::attention::StatusMap {
+                needs_you: Some([1, 2, 3]),
+                failed: Some([4, 5, 6]),
+                done: Some([7, 8, 9]),
+                working: Some([10, 11, 12]),
+                quiet: Some([13, 14, 15]),
+                new_output: Some([16, 17, 18]),
+            },
+            notification_details: Some(false),
+        },
         ..Default::default()
     }
 }
@@ -267,14 +317,24 @@ fn kdl_names_in(config: &Config) -> BTreeSet<(SettingSection, String)> {
         "env",
         "web_client",
         "context_menu",
-        "window",
+        "terminal",
+        "attention",
     ];
     let mut names = BTreeSet::new();
     for node in document.nodes() {
         let name = node.name().value();
         if !blocks.contains(&name) {
             names.insert((SettingSection::TopLevel, name.to_owned()));
-        } else if !["keybinds", "mousebinds", "ui", "web_client", "window"].contains(&name) {
+        } else if ![
+            "keybinds",
+            "mousebinds",
+            "ui",
+            "web_client",
+            "terminal",
+            "attention",
+        ]
+        .contains(&name)
+        {
             names.insert((SettingSection::Blocks, name.to_owned()));
         }
     }
@@ -296,8 +356,30 @@ fn kdl_names_in(config: &Config) -> BTreeSet<(SettingSection, String)> {
     for node in web_client.nodes() {
         names.insert((SettingSection::WebClient, node.name().value().to_owned()));
     }
+    let attention = document
+        .get("attention")
+        .and_then(|attention| attention.children())
+        .unwrap();
+    for node in attention.nodes() {
+        let section = match node.name().value() {
+            "desktop_notifications" => Some(SettingSection::AttentionPopups),
+            "tray_badge" => Some(SettingSection::AttentionBadge),
+            "tray_badge_colors" => Some(SettingSection::AttentionBadgeColors),
+            _ => None,
+        };
+        match section {
+            Some(section) => {
+                for child in node.children().unwrap().nodes() {
+                    names.insert((section, child.name().value().to_owned()));
+                }
+            },
+            None => {
+                names.insert((SettingSection::Attention, node.name().value().to_owned()));
+            },
+        }
+    }
     let window = document
-        .get("window")
+        .get("terminal")
         .and_then(|window| window.children())
         .unwrap();
     for node in window.nodes() {
@@ -305,12 +387,12 @@ fn kdl_names_in(config: &Config) -> BTreeSet<(SettingSection, String)> {
         if name == "theme" {
             for colour in node.children().unwrap().nodes() {
                 names.insert((
-                    SettingSection::WindowTheme,
+                    SettingSection::TerminalTheme,
                     colour.name().value().to_owned(),
                 ));
             }
         } else {
-            names.insert((SettingSection::Window, name.to_owned()));
+            names.insert((SettingSection::Terminal, name.to_owned()));
         }
     }
     names
@@ -446,31 +528,31 @@ fn a_partial_ui_or_web_client_block_keeps_the_other_values() {
 fn window_values_are_shown_as_plain_text() {
     let config = every_setting_set();
     assert_eq!(
-        setting_value(&config, SettingKey::WindowFontSize).as_deref(),
+        setting_value(&config, SettingKey::TerminalFontSize).as_deref(),
         Some("13.5")
     );
     assert_eq!(
-        setting_value(&config, SettingKey::WindowOpacity).as_deref(),
+        setting_value(&config, SettingKey::TerminalOpacity).as_deref(),
         Some("0.9")
     );
     assert_eq!(
-        setting_value(&config, SettingKey::WindowPadding).as_deref(),
+        setting_value(&config, SettingKey::TerminalPadding).as_deref(),
         Some("4")
     );
     assert_eq!(
-        setting_value(&config, SettingKey::WindowPasteKeys).as_deref(),
+        setting_value(&config, SettingKey::TerminalPasteKeys).as_deref(),
         Some("Ctrl Shift v, Shift insert")
     );
     assert_eq!(
-        setting_value(&config, SettingKey::WindowColorForeground).as_deref(),
+        setting_value(&config, SettingKey::TerminalColorForeground).as_deref(),
         Some("#c8c9ca")
     );
     assert_eq!(
-        setting_value(&config, SettingKey::WindowColorRed).as_deref(),
+        setting_value(&config, SettingKey::TerminalColorRed).as_deref(),
         Some("#ff0000")
     );
     assert_eq!(
-        setting_value(&config, SettingKey::WindowColorCursor).as_deref(),
+        setting_value(&config, SettingKey::TerminalColorCursor).as_deref(),
         Some("7")
     );
 }
@@ -479,10 +561,10 @@ fn window_values_are_shown_as_plain_text() {
 fn a_window_setting_applied_live_changes_only_that_setting() {
     let base = every_setting_set();
     for (key, value) in [
-        (SettingKey::WindowOpacity, "0.5"),
-        (SettingKey::WindowFontFeatures, "liga, zero"),
-        (SettingKey::WindowColorBlue, "#123456"),
-        (SettingKey::WindowCursorStyle, "underline"),
+        (SettingKey::TerminalOpacity, "0.5"),
+        (SettingKey::TerminalFontFeatures, "liga, zero"),
+        (SettingKey::TerminalColorBlue, "#123456"),
+        (SettingKey::TerminalCursorStyle, "underline"),
     ] {
         let changed = Config::from_kdl(&key.kdl_snippet(value), Some(base.clone())).unwrap();
         assert_eq!(differing_settings(&base, &changed), vec![key]);

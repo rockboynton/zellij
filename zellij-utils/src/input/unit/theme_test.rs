@@ -171,7 +171,12 @@ fn the_bundled_default_themes_are_readable() {
         }
 
         let ribbon = styling.ribbon_unselected;
-        for (part, color) in [("base", ribbon.base), ("emphasis_0", ribbon.emphasis_0)] {
+        for (part, color) in [
+            ("base", ribbon.base),
+            ("emphasis_0", ribbon.emphasis_0),
+            ("emphasis_1", ribbon.emphasis_1),
+            ("emphasis_2", ribbon.emphasis_2),
+        ] {
             assert_contrast(
                 name,
                 &format!("ribbon_unselected.{} on its background", part),
@@ -179,11 +184,21 @@ fn the_bundled_default_themes_are_readable() {
                 ribbon.background,
                 4.5,
             );
+        }
+
+        let hover = styling.ribbon_hover_style();
+        for (part, color) in [
+            ("base", hover.base),
+            ("emphasis_0", hover.emphasis_0),
+            ("emphasis_1", hover.emphasis_1),
+            ("emphasis_2", hover.emphasis_2),
+            ("emphasis_3", hover.emphasis_3),
+        ] {
             assert_contrast(
                 name,
-                &format!("ribbon_unselected.{} on the hover fill", part),
+                &format!("ribbon_hover.{} on the hover fill", part),
                 color,
-                ribbon.emphasis_1,
+                hover.background,
                 4.5,
             );
         }
@@ -271,6 +286,52 @@ fn the_bundled_default_themes_are_readable() {
                 4.5,
             );
         }
+    }
+}
+
+const THEMES_FOLLOWING_THE_TERMINAL_PALETTE: [&str; 1] = ["ansi"];
+
+#[test]
+fn every_bundled_theme_meets_the_contrast_targets_for_what_it_draws() {
+    use crate::input::theme_contrast::pair_contrasts;
+    let mut failures = vec![];
+    for (name, theme) in bundled_themes().inner() {
+        if THEMES_FOLLOWING_THE_TERMINAL_PALETTE.contains(&name.as_str()) {
+            continue;
+        }
+        for found in pair_contrasts(&theme.palette) {
+            if !found.passes() {
+                failures.push(format!(
+                    "{}: {}.{} on {} is {:.2}, below {:.1}",
+                    name,
+                    found.pair.foreground.0,
+                    found.pair.foreground.1,
+                    found.pair.background.describe(),
+                    found.ratio,
+                    found.pair.target
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn every_bundled_theme_shows_a_selected_row_apart_from_the_page() {
+    use crate::input::theme_contrast::contrast;
+    for (name, theme) in bundled_themes().inner() {
+        if THEMES_FOLLOWING_THE_TERMINAL_PALETTE.contains(&name.as_str()) {
+            continue;
+        }
+        let page = theme.palette.text_unselected.background;
+        let selected = theme.palette.text_selected.background;
+        let ratio = contrast(selected, page);
+        assert!(
+            ratio >= 1.2,
+            "{}: the selected row background is only {:.2} apart from the page",
+            name,
+            ratio
+        );
     }
 }
 

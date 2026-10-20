@@ -129,10 +129,13 @@ Config {
         support_kitty_keyboard_protocol: None,
         support_kitty_graphics_protocol: None,
         grapheme_clusters: None,
+        mirror_resizes_source_pane: None,
+        live_view_release_key: None,
         web_server: None,
         web_sharing: None,
         stacked_resize: None,
         stacked_pane_list: None,
+        stacked_pane_list_orientation: None,
         show_startup_tips: None,
         show_release_notes: None,
         advanced_mouse_actions: None,
@@ -157,10 +160,12 @@ Config {
         client_async_worker_tasks: None,
         nested_session_handling: None,
         dangerously_enable_paste_buffer_read: None,
-        session_card: None,
         session_indicator: None,
         swap_layout_notification: None,
         on_quit: None,
+        bars_hidden_on_start: None,
+        hidden_bars_notification: None,
+        mode_hints_when_bars_hidden: None,
     },
     themes: {},
     plugins: PluginAliases {
@@ -375,6 +380,16 @@ Config {
     context_menu: ContextMenuConfig {
         pane: [
             Item {
+                label: "Paste",
+                actions: [
+                    ClickedPane(
+                        PasteFromClipboard,
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Separator,
+            Item {
                 label: "New pane",
                 actions: [
                     Action(
@@ -385,6 +400,7 @@ Config {
                         },
                     ),
                 ],
+                toggled_label: None,
             },
             Item {
                 label: "New floating pane",
@@ -400,8 +416,18 @@ Config {
                         },
                     ),
                 ],
+                toggled_label: None,
             },
             Separator,
+            Item {
+                label: "Rename pane…",
+                actions: [
+                    ClickedPane(
+                        StartRename,
+                    ),
+                ],
+                toggled_label: None,
+            },
             Item {
                 label: "Fullscreen",
                 actions: [
@@ -409,30 +435,54 @@ Config {
                         ToggleFocusFullscreen,
                     ),
                 ],
+                toggled_label: Some(
+                    "Exit fullscreen",
+                ),
             },
             Item {
-                label: "Float / Embed",
+                label: "Make floating",
                 actions: [
                     ClickedPane(
                         ToggleEmbedOrFloating,
                     ),
                 ],
+                toggled_label: Some(
+                    "Make tiled",
+                ),
             },
             Item {
-                label: "Rename pane",
+                label: "Show titles in a row",
                 actions: [
                     ClickedPane(
-                        StartRename,
+                        ToggleStackListOrientation,
                     ),
                 ],
+                toggled_label: Some(
+                    "Show titles in a column",
+                ),
+            },
+            Separator,
+            Item {
+                label: "Watch pane",
+                actions: [
+                    ClickedPane(
+                        ToggleWatch,
+                    ),
+                ],
+                toggled_label: Some(
+                    "Stop watching",
+                ),
             },
             Item {
-                label: "Add to group",
+                label: "Mute pane",
                 actions: [
                     ClickedPane(
-                        ToggleInGroup,
+                        ToggleMute,
                     ),
                 ],
+                toggled_label: Some(
+                    "Unmute pane",
+                ),
             },
             Separator,
             Item {
@@ -442,6 +492,7 @@ Config {
                         CloseFocus,
                     ),
                 ],
+                toggled_label: None,
             },
         ],
         tab: [
@@ -462,17 +513,19 @@ Config {
                         },
                     ),
                 ],
+                toggled_label: None,
             },
             Item {
-                label: "Rename tab",
+                label: "Rename tab…",
                 actions: [
                     ClickedTab(
                         StartRename,
                     ),
                 ],
+                toggled_label: None,
             },
             Item {
-                label: "Move tab left",
+                label: "Move left",
                 actions: [
                     ClickedTab(
                         Move(
@@ -480,9 +533,10 @@ Config {
                         ),
                     ),
                 ],
+                toggled_label: None,
             },
             Item {
-                label: "Move tab right",
+                label: "Move right",
                 actions: [
                     ClickedTab(
                         Move(
@@ -490,9 +544,10 @@ Config {
                         ),
                     ),
                 ],
+                toggled_label: None,
             },
             Item {
-                label: "Move tab to start",
+                label: "Move to start",
                 actions: [
                     ClickedTab(
                         MoveToPosition(
@@ -500,9 +555,10 @@ Config {
                         ),
                     ),
                 ],
+                toggled_label: None,
             },
             Item {
-                label: "Move tab to end",
+                label: "Move to end",
                 actions: [
                     ClickedTab(
                         MoveToPosition(
@@ -510,6 +566,18 @@ Config {
                         ),
                     ),
                 ],
+                toggled_label: None,
+            },
+            Item {
+                label: "Mute tab",
+                actions: [
+                    ClickedTab(
+                        Mute,
+                    ),
+                ],
+                toggled_label: Some(
+                    "Unmute tab",
+                ),
             },
             Separator,
             Item {
@@ -519,21 +587,10 @@ Config {
                         Close,
                     ),
                 ],
+                toggled_label: None,
             },
         ],
         bar: [
-            Item {
-                label: "New pane",
-                actions: [
-                    Action(
-                        NewPane {
-                            direction: None,
-                            pane_name: None,
-                            start_suppressed: false,
-                        },
-                    ),
-                ],
-            },
             Item {
                 label: "New tab",
                 actions: [
@@ -551,9 +608,115 @@ Config {
                         },
                     ),
                 ],
+                toggled_label: None,
+            },
+            Separator,
+            Item {
+                label: "Rename session…",
+                actions: [
+                    Action(
+                        SwitchToMode {
+                            input_mode: RenameSession,
+                        },
+                    ),
+                    Action(
+                        SessionNameInput {
+                            input: [
+                                0,
+                            ],
+                        },
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Item {
+                label: "Back to {}",
+                actions: [
+                    Action(
+                        ToggleSession,
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Item {
+                label: "Session manager…",
+                actions: [
+                    Action(
+                        LaunchOrFocusPlugin {
+                            plugin: Alias(
+                                PluginAlias {
+                                    name: "session-manager",
+                                    configuration: Some(
+                                        PluginUserConfiguration(
+                                            {},
+                                        ),
+                                    ),
+                                    initial_cwd: None,
+                                    run_plugin: None,
+                                },
+                            ),
+                            should_float: true,
+                            move_to_focused_tab: true,
+                            should_open_in_place: false,
+                            close_replaced_pane: false,
+                            skip_cache: false,
+                            tab_id: None,
+                        },
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Item {
+                label: "Open in a Zellij terminal",
+                actions: [
+                    Action(
+                        OpenSessionInTerminal,
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Separator,
+            Item {
+                label: "Hide {}",
+                actions: [
+                    ClickedPane(
+                        HideBar,
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Item {
+                label: "Hide all bars",
+                actions: [
+                    Action(
+                        HideBars {
+                            bars: [],
+                        },
+                    ),
+                ],
+                toggled_label: None,
+            },
+            Separator,
+            Item {
+                label: "Detach",
+                actions: [
+                    Action(
+                        Detach,
+                    ),
+                ],
+                toggled_label: None,
             },
         ],
         common: [
+            Item {
+                label: "Show bars",
+                actions: [
+                    Action(
+                        ShowBars,
+                    ),
+                ],
+                toggled_label: None,
+            },
             Item {
                 label: "Settings…",
                 actions: [
@@ -580,41 +743,7 @@ Config {
                         },
                     ),
                 ],
-            },
-            Item {
-                label: "Session manager",
-                actions: [
-                    Action(
-                        LaunchOrFocusPlugin {
-                            plugin: Alias(
-                                PluginAlias {
-                                    name: "session-manager",
-                                    configuration: Some(
-                                        PluginUserConfiguration(
-                                            {},
-                                        ),
-                                    ),
-                                    initial_cwd: None,
-                                    run_plugin: None,
-                                },
-                            ),
-                            should_float: true,
-                            move_to_focused_tab: true,
-                            should_open_in_place: false,
-                            close_replaced_pane: false,
-                            skip_cache: false,
-                            tab_id: None,
-                        },
-                    ),
-                ],
-            },
-            Item {
-                label: "Detach",
-                actions: [
-                    Action(
-                        Detach,
-                    ),
-                ],
+                toggled_label: None,
             },
         ],
     },
@@ -839,6 +968,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -1138,6 +1282,21 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -1419,6 +1578,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -1718,6 +1892,21 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -1999,6 +2188,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -2298,6 +2502,21 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -2579,6 +2798,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -2878,6 +3112,21 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -3159,6 +3408,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -3458,6 +3722,21 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -3739,6 +4018,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -4038,6 +4332,21 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -4319,6 +4628,21 @@ Config {
             }: MouseBinding {
                 kind: Behaviour(
                     Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
                 ),
                 app_first: None,
             },
@@ -4618,6 +4942,326 @@ Config {
                     Ctrl,
                 },
                 click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Frame,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ResizePane,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    GroupToggle,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Right,
+                modifiers: {},
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ContextMenu,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Right,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ContextMenu,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Right,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Ungroup,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Middle,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Ignore,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollUp,
+                modifiers: {},
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Scroll(
+                        3,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollUp,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ResizeScroll(
+                        Increase,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollUp,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ScrollToPrompt(
+                        Previous,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollDown,
+                modifiers: {},
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Scroll(
+                        3,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollDown,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ResizeScroll(
+                        Decrease,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollDown,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ScrollToPrompt(
+                        Next,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollLeft,
+                modifiers: {},
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ScrollColumns(
+                        4,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollLeft,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ScrollColumns(
+                        4,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollLeft,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Ignore,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollRight,
+                modifiers: {},
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ScrollColumns(
+                        4,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollRight,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ScrollColumns(
+                        4,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: ScrollRight,
+                modifiers: {
+                    Alt,
+                },
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Ignore,
+                ),
+                app_first: None,
+            },
+        },
+        RenameSession: {
+            MouseTrigger {
+                button: Left,
+                modifiers: {},
+                click_count: 1,
+                target: Any,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Click,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {},
+                click_count: 2,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {},
+                click_count: 2,
+                target: Frame,
+            }: MouseBinding {
+                kind: Behaviour(
+                    ToggleFullscreen,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {},
+                click_count: 3,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    Select,
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
+                target: Content,
+            }: MouseBinding {
+                kind: Behaviour(
+                    DrawFloatingPane(
+                        None,
+                    ),
+                ),
+                app_first: None,
+            },
+            MouseTrigger {
+                button: Left,
+                modifiers: {
+                    Ctrl,
+                },
+                click_count: 1,
                 target: Frame,
             }: MouseBinding {
                 kind: Behaviour(
@@ -4858,8 +5502,11 @@ Config {
             },
         },
     },
-    window: WindowConfig {
+    terminal: TerminalConfig {
         font: None,
+        font_bold: None,
+        font_italic: None,
+        font_bold_italic: None,
         font_size: None,
         system_fonts: None,
         ligatures: None,
@@ -4872,11 +5519,13 @@ Config {
         middle_click_paste: None,
         open_links: None,
         bell: None,
-        notifications: None,
         startup_mode: None,
+        terminal_requests: None,
         opacity: None,
         opacity_mode: None,
         blur: None,
+        window_decorations: None,
+        titlebar_theme: None,
         macos_option_as_alt: None,
         theme: None,
         padding: None,
@@ -4906,6 +5555,8 @@ Config {
         open_links_with_shift: None,
         shift_drag_selects: None,
         copy_keys: None,
+        reuse_session_windows: None,
+        allow_remote_clipboard_read: None,
     },
     session_suggestions: SessionSuggestionsConfig {
         facts: [],
@@ -4913,5 +5564,43 @@ Config {
         then: None,
         script: None,
         record: None,
+    },
+    attention: AttentionConfig {
+        frame_markers: None,
+        host_status: None,
+        tab_markers: None,
+        idle_rule: None,
+        done_threshold_secs: None,
+        track_commands: None,
+        idle_activity_secs: None,
+        idle_silence_secs: None,
+        startup_card: None,
+        tray_icon: None,
+        enabled: None,
+        desktop_notifications: StatusMap {
+            needs_you: None,
+            failed: None,
+            done: None,
+            working: None,
+            quiet: None,
+            new_output: None,
+        },
+        tray_badge: StatusMap {
+            needs_you: None,
+            failed: None,
+            done: None,
+            working: None,
+            quiet: None,
+            new_output: None,
+        },
+        tray_badge_colors: StatusMap {
+            needs_you: None,
+            failed: None,
+            done: None,
+            working: None,
+            quiet: None,
+            new_output: None,
+        },
+        notification_details: None,
     },
 }

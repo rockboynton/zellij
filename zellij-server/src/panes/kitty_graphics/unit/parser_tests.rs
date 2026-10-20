@@ -218,10 +218,31 @@ fn known_but_unsupported_keys_do_not_break_valid_command() {
 }
 
 #[test]
-fn unicode_placeholder_key_is_enotsupported() {
+fn unicode_placeholder_key_is_accepted_and_flagged() {
     let mut parser = KittyCommandParser::new();
-    let err = parse_one(&mut parser, b"a=T,U=1,f=24,s=1,v=1;AAAA").unwrap_err();
-    assert_eq!(err.code, KittyErrorCode::Enotsupported);
+    let command = parse_one(&mut parser, b"a=T,U=1,f=24,s=1,v=1,c=20,r=5;AAAA").unwrap();
+    assert!(command.unicode_placeholder);
+    assert_eq!(command.columns, 20);
+    assert_eq!(command.rows, 5);
+    assert!(command.image.is_some());
+}
+
+#[test]
+fn unicode_placeholder_key_absent_or_zero_is_not_flagged() {
+    let mut parser = KittyCommandParser::new();
+    let command = parse_one(&mut parser, b"a=T,U=0,f=24,s=1,v=1;AAAA").unwrap();
+    assert!(!command.unicode_placeholder);
+    let command = parse_one(&mut parser, b"a=T,f=24,s=1,v=1;AAAA").unwrap();
+    assert!(!command.unicode_placeholder);
+}
+
+#[test]
+fn invalid_unicode_placeholder_modes_are_rejected() {
+    for mode in ["2", "4294967295", "invalid"] {
+        let mut parser = KittyCommandParser::new();
+        let command = format!("a=p,U={mode},i=42");
+        assert!(parse_one(&mut parser, command.as_bytes()).is_err());
+    }
 }
 
 #[test]
@@ -281,7 +302,7 @@ fn file_medium_nonexistent_path_is_ebadf() {
 fn temp_file_medium_inside_temp_dir_is_deleted_after_read() {
     let raster = raster_12_bytes();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("img.bin");
+    let path = dir.path().join("tty-graphics-protocol-img.bin");
     std::fs::write(&path, &raster).unwrap();
     let mut parser = KittyCommandParser::new();
     let command = parse_one(
@@ -369,7 +390,7 @@ fn file_medium_offset_beyond_eof_is_ebadf() {
 }
 
 #[test]
-fn temp_file_outside_temp_dir_with_magic_name_is_deleted() {
+fn temp_file_outside_temp_dir_with_magic_name_is_not_deleted() {
     let raster = raster_12_bytes();
     let dir = tempfile::Builder::new()
         .prefix("kitty-parser-test")
@@ -384,5 +405,70 @@ fn temp_file_outside_temp_dir_with_magic_name_is_deleted() {
     )
     .unwrap();
     assert_eq!(command.image.unwrap().bytes, raster);
-    assert!(!path.exists());
+    assert!(path.exists());
+}
+
+#[test]
+fn temp_file_inside_temp_dir_without_magic_name_is_not_deleted() {
+    let raster = raster_12_bytes();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("img.bin");
+    std::fs::write(&path, &raster).unwrap();
+    let mut parser = KittyCommandParser::new();
+    let command = parse_one(
+        &mut parser,
+        &raw_cmd("a=T,f=24,s=2,v=2,t=t", path.to_str().unwrap().as_bytes()),
+    )
+    .unwrap();
+    assert_eq!(command.image.unwrap().bytes, raster);
+    assert!(path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn temp_file_path_escaping_temp_dir_is_not_deleted() {
+    let raster = raster_12_bytes();
+    let dir = tempfile::Builder::new()
+        .prefix("kitty-parser-test")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    let path = dir.path().join("tty-graphics-protocol-victim.bin");
+    std::fs::write(&path, &raster).unwrap();
+    let temp_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    let victim = std::fs::canonicalize(&path).unwrap();
+    let mut escaping = temp_root.clone();
+    for _ in temp_root.components().skip(1) {
+        escaping.push("..");
+    }
+    escaping.push(victim.strip_prefix("/").unwrap());
+    let mut parser = KittyCommandParser::new();
+    let command = parse_one(
+        &mut parser,
+        &raw_cmd(
+            "a=T,f=24,s=2,v=2,t=t",
+            escaping.to_str().unwrap().as_bytes(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(command.image.unwrap().bytes, raster);
+    assert!(path.exists());
+}
+
+#[test]
+fn chunked_upload_exceeding_payload_cap_is_rejected() {
+    let mut parser = KittyCommandParser::new();
+    let chunk = vec![b'A'; 1 << 20];
+    assert!(parser
+        .parse(&raw_cmd("a=t,f=32,s=1,v=1,i=7,m=1", b"AAAA"))
+        .is_none());
+    let mut result = None;
+    for _ in 0..200 {
+        result = parser.parse(&raw_cmd("m=1", &chunk));
+        if result.is_some() {
+            break;
+        }
+    }
+    let err = result.unwrap().unwrap_err();
+    assert_eq!(err.code, KittyErrorCode::Einval);
+    assert!(!parser.has_pending());
 }

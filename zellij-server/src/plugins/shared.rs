@@ -383,6 +383,17 @@ fn render_request(
     render_and_send(senders, running_plugin, targets)
 }
 
+fn report_instance_error(
+    senders: &ThreadSenders,
+    running_plugin: &RunningPlugin,
+    error: anyhow::Error,
+) {
+    let _ = senders.send_to_plugin(PluginInstruction::UnregisterSettingsEntry(
+        running_plugin.store.data().plugin_id,
+    ));
+    report_error(senders, pane_slot_ids(running_plugin), error);
+}
+
 fn report_error(senders: &ThreadSenders, pane_slots: Vec<PluginId>, error: anyhow::Error) {
     log::error!("{:?}", error);
     let message = format!("{:?}", error).replace("\n", "\n\r");
@@ -491,6 +502,8 @@ pub fn apply_events_job(
                 continue;
             },
         }
+        let mut event = event.clone();
+        super::wasm_bridge::redact_event_for_plugin(running_plugin.store.data(), &mut event);
         match call_update(&mut running_plugin, &event, keybinds.as_deref(), context) {
             Ok(requested) => {
                 render = render.merge(requested);
@@ -499,16 +512,14 @@ pub fn apply_events_job(
                 }
             },
             Err(e) => {
-                let pane_slots = pane_slot_ids(&running_plugin);
-                report_error(&senders, pane_slots, e);
+                report_instance_error(&senders, &running_plugin, e);
                 return;
             },
         }
     }
     send_pipe_changes(&senders, &mut running_plugin, instance_id, None);
     if let Err(e) = render_request(&senders, &mut running_plugin, render) {
-        let pane_slots = pane_slot_ids(&running_plugin);
-        report_error(&senders, pane_slots, e);
+        report_instance_error(&senders, &running_plugin, e);
     }
 }
 
@@ -543,15 +554,13 @@ pub fn apply_pipes_job(
                 for (remaining, _) in messages {
                     release_pipe(&senders, instance_id, &remaining);
                 }
-                let pane_slots = pane_slot_ids(&running_plugin);
-                report_error(&senders, pane_slots, e);
+                report_instance_error(&senders, &running_plugin, e);
                 return;
             },
         }
     }
     if let Err(e) = render_request(&senders, &mut running_plugin, render) {
-        let pane_slots = pane_slot_ids(&running_plugin);
-        report_error(&senders, pane_slots, e);
+        report_instance_error(&senders, &running_plugin, e);
     }
 }
 
@@ -689,8 +698,7 @@ pub fn client_job(
         call_client_disconnected(&mut running_plugin, client_id)
     };
     if let Err(e) = result {
-        let pane_slots = pane_slot_ids(&running_plugin);
-        report_error(&senders, pane_slots, e);
+        report_instance_error(&senders, &running_plugin, e);
     }
 }
 
@@ -724,8 +732,7 @@ pub fn resize_job(
             &mut running_plugin,
             RenderResponse::Slots(vec![slot_id]),
         ) {
-            let pane_slots = pane_slot_ids(&running_plugin);
-            report_error(&senders, pane_slots, e);
+            report_instance_error(&senders, &running_plugin, e);
         }
     }
 }
@@ -752,8 +759,7 @@ pub fn visibility_job(
             .filter(|target| !before.contains(target))
             .collect();
     if let Err(e) = render_and_send(&senders, &mut running_plugin, newly_visible) {
-        let pane_slots = pane_slot_ids(&running_plugin);
-        report_error(&senders, pane_slots, e);
+        report_instance_error(&senders, &running_plugin, e);
     }
 }
 
@@ -864,8 +870,7 @@ pub fn start_instance_job(
                 let _ = senders
                     .send_to_background_jobs(BackgroundJob::StopPluginLoadingAnimation(*slot_id));
             }
-            let pane_slots = pane_slot_ids(&running_plugin);
-            report_error(&senders, pane_slots, e);
+            report_instance_error(&senders, &running_plugin, e);
         },
     }
 }

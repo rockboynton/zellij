@@ -37,34 +37,24 @@ pub fn render_tab(
     separator: &str,
     dimmed: bool,
     max_width: usize,
+    marker: Option<crate::tab_marker::TabMarker>,
 ) -> LinePart {
     let focused_clients = tab.other_focused_client_slots.as_slice();
     let separator_width = graphemes::display_width(separator);
 
-    let alternate_tab_color = if is_alternate_tab {
-        palette.ribbon_unselected.emphasis_1
+    let on_hover_fill = !tab.active && (is_hovered || is_alternate_tab);
+    let declaration = if tab.active {
+        palette.ribbon_selected
+    } else if on_hover_fill {
+        palette.ribbon_hover_style()
     } else {
-        palette.ribbon_unselected.background
+        palette.ribbon_unselected
     };
-    let background_color = if tab.active {
-        palette.ribbon_selected.background
-    } else if is_hovered {
-        palette.ribbon_unselected.emphasis_1
-    } else if is_alternate_tab {
-        alternate_tab_color
-    } else {
-        palette.ribbon_unselected.background
-    };
+    let background_color = declaration.background;
     let foreground_color = if tab.is_flashing_bell {
-        if tab.active {
-            palette.ribbon_selected.emphasis_3
-        } else {
-            palette.ribbon_unselected.emphasis_3
-        }
-    } else if tab.active {
-        palette.ribbon_selected.base
+        declaration.emphasis_3
     } else {
-        palette.ribbon_unselected.base
+        declaration.base
     };
 
     let separator_fill_color = palette.text_unselected.background;
@@ -94,10 +84,22 @@ pub fn render_tab(
         .as_ref()
         .map(|(_, extra_length)| extra_length + 2)
         .unwrap_or(0);
-    let decoration_len = (separator_width * 2) + 2 + cursor_len;
+    let marker_len = marker.as_ref().map(|marker| marker.width()).unwrap_or(0);
+    let decoration_len = (separator_width * 2) + 2 + cursor_len + marker_len;
     let text = fit_tab_text(text, max_width.saturating_sub(decoration_len));
     let tab_text_len = graphemes::display_width(&text) + decoration_len;
-    let tab_styled_text = text_style.paint(format!(" {} ", text));
+    let marker_part = match marker {
+        Some(marker) => {
+            let color = if dimmed {
+                palette.ribbon_unselected.base
+            } else {
+                foreground_color
+            };
+            marker.paint(color, background_color).to_string()
+        },
+        None => String::new(),
+    };
+    let tab_styled_text = format!("{}{}", text_style.paint(format!(" {} ", text)), marker_part);
 
     let right_separator = right_separator_style.paint(separator);
     let tab_styled_text = if let Some((cursor_section, _)) = cursor_info {
@@ -106,14 +108,14 @@ pub fn render_tab(
         let cursor_section = ANSIStrings(&cursor_section).to_string();
         let cursor_end = text_style.paint("]").to_string();
         s.push_str(&left_separator.to_string());
-        s.push_str(&tab_styled_text.to_string());
+        s.push_str(&tab_styled_text);
         s.push_str(&cursor_beginning);
         s.push_str(&cursor_section);
         s.push_str(&cursor_end);
         s.push_str(&right_separator.to_string());
         s
     } else {
-        ANSIStrings(&[left_separator, tab_styled_text, right_separator]).to_string()
+        format!("{}{}{}", left_separator, tab_styled_text, right_separator)
     };
 
     LinePart {
@@ -141,9 +143,7 @@ pub fn tab_style(
     } else if tab.is_sync_panes_active {
         tabname.push_str(" (SYNC)");
     }
-    if tab.has_bell_notification || tab.is_flashing_bell {
-        tabname.push_str(" [!]");
-    }
+    let marker = crate::tab_marker::TabMarker::for_tab(tab, capabilities.arrow_fonts);
     if !capabilities.arrow_fonts {
         is_alternate_tab = false;
     }
@@ -158,6 +158,7 @@ pub fn tab_style(
         separator,
         dimmed,
         max_width,
+        marker,
     )
 }
 

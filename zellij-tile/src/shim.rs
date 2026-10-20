@@ -1016,11 +1016,148 @@ pub fn get_session_preview(name: &str, tab_index: Option<usize>, pane_id: Option
         name: name.to_owned(),
         tab_index,
         pane_id,
+        anchor: None,
     });
+}
+
+pub fn get_session_preview_with_history(
+    name: &str,
+    tab_index: Option<usize>,
+    pane_id: Option<(u32, bool)>,
+) {
+    run_plugin_command(PluginCommand::GetSessionPreview {
+        name: name.to_owned(),
+        tab_index,
+        pane_id,
+        anchor: Some(PreviewAnchor::Bottom),
+    });
+}
+
+pub fn get_session_pane_preview(name: &str, pane_id: PaneId, anchor: PreviewAnchor) {
+    let pane_id = match pane_id {
+        PaneId::Terminal(id) => (id, false),
+        PaneId::Plugin(id) => (id, true),
+    };
+    run_plugin_command(PluginCommand::GetSessionPreview {
+        name: name.to_owned(),
+        tab_index: None,
+        pane_id: Some(pane_id),
+        anchor: Some(anchor),
+    });
+}
+
+pub fn mark_session_pane_seen(session_name: &str, pane_id: PaneId) {
+    run_plugin_command(PluginCommand::MarkSessionPaneSeen {
+        session_name: session_name.to_owned(),
+        pane_id,
+    });
+}
+
+pub fn mark_all_seen(session_name: Option<&str>) {
+    run_plugin_command(PluginCommand::MarkAllSeen {
+        session_name: session_name.map(|s| s.to_owned()),
+    });
+}
+
+pub fn open_session_terminal(session_name: &str, new_window: bool) {
+    run_plugin_command(PluginCommand::OpenSessionTerminal(
+        SessionTerminalRequest::existing(session_name, None, new_window),
+    ));
+}
+
+pub fn open_session_pane_terminal(session_name: &str, pane_id: PaneId, new_window: bool) {
+    run_plugin_command(PluginCommand::OpenSessionTerminal(
+        SessionTerminalRequest::existing(session_name, Some(pane_id), new_window),
+    ));
+}
+
+pub fn request_session_terminal(request: SessionTerminalRequest) {
+    run_plugin_command(PluginCommand::OpenSessionTerminal(request));
+}
+
+pub fn open_new_session_terminal(
+    session_name: Option<&str>,
+    layout: Option<LayoutInfo>,
+    cwd: Option<PathBuf>,
+) {
+    run_plugin_command(PluginCommand::OpenSessionTerminal(
+        SessionTerminalRequest::new_session(session_name, layout, cwd),
+    ));
+}
+
+pub fn write_to_session_pane(session_name: &str, pane_id: PaneId, bytes: Vec<u8>) {
+    run_plugin_command(PluginCommand::WriteToSessionPane {
+        session_name: session_name.to_owned(),
+        pane_id,
+        bytes,
+    });
+}
+
+pub fn send_key_to_session_pane(session_name: &str, pane_id: PaneId, key: KeyWithModifier) {
+    run_plugin_command(PluginCommand::SendKeyToSessionPane {
+        session_name: session_name.to_owned(),
+        pane_id,
+        key,
+    });
+}
+
+pub fn toggle_session_pane_mute(session_name: &str, pane_id: PaneId) {
+    run_plugin_command(PluginCommand::ToggleSessionPaneMute {
+        session_name: session_name.to_owned(),
+        pane_id,
+    });
+}
+
+pub fn toggle_session_pane_ignore_output(session_name: &str, pane_id: PaneId) {
+    run_plugin_command(PluginCommand::ToggleSessionPaneIgnoreOutput {
+        session_name: session_name.to_owned(),
+        pane_id,
+    });
+}
+
+pub fn toggle_session_pane_watch(session_name: &str, pane_id: PaneId) {
+    run_plugin_command(PluginCommand::ToggleSessionPaneWatch {
+        session_name: session_name.to_owned(),
+        pane_id,
+    });
+}
+
+pub fn focus_session_pane(session_name: &str, pane_id: PaneId) {
+    run_plugin_command(PluginCommand::FocusSessionPane {
+        session_name: session_name.to_owned(),
+        pane_id,
+    });
+}
+
+pub fn set_live_view(view: Option<LiveView>) {
+    run_plugin_command(PluginCommand::SetLiveView(view));
+}
+
+pub fn set_live_view_input(capture: bool) {
+    run_plugin_command(PluginCommand::SetLiveViewInput(capture));
 }
 
 pub fn get_saved_session_preview(name: &str) {
     run_plugin_command(PluginCommand::GetSavedSessionPreview(name.to_owned()));
+}
+
+pub fn request_desktop_integration(request: &zellij_utils::desktop_integration::Request) {
+    run_plugin_command(PluginCommand::DesktopIntegration(request.to_json()));
+}
+
+/// List this plugin in the settings screen. Selecting it sends an [`OPEN_PLUGIN_SETTINGS_MESSAGE`]
+/// pipe message, with the selecting client in [`OPEN_PLUGIN_SETTINGS_CLIENT_ID_ARG`].
+///
+/// # Permissions Required
+/// * `ChangeApplicationState`
+pub fn register_settings_entry(title: &str) {
+    run_plugin_command(PluginCommand::RegisterSettingsEntry(title.to_owned()));
+}
+
+/// # Permissions Required
+/// * `ChangeApplicationState`
+pub fn unregister_settings_entry() {
+    run_plugin_command(PluginCommand::UnregisterSettingsEntry);
 }
 
 pub fn hide_self() {
@@ -1466,6 +1603,27 @@ pub fn get_nested_session_keybinds(pane_id: PaneId) -> NestedSessionKeybindsResp
 /// Toggle the UI pane frames on or off
 pub fn toggle_pane_frames() {
     let plugin_command = PluginCommand::TogglePaneFrames;
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+pub fn toggle_bars(bar_names: Vec<String>) {
+    let plugin_command = PluginCommand::ToggleBars(bar_names);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+pub fn hide_bars(bar_names: Vec<String>) {
+    let plugin_command = PluginCommand::HideBars(bar_names);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+pub fn show_bars() {
+    let plugin_command = PluginCommand::ShowBars;
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
@@ -2738,7 +2896,11 @@ pub fn toggle_pane_id_fullscreen(pane_id: PaneId) {
 
 /// Embed the specified pane (make it stop floating) or turn it to a float pane if it is not
 pub fn toggle_pane_embed_or_eject_for_pane_id(pane_id: PaneId) {
-    let plugin_command = PluginCommand::TogglePaneEmbedOrEjectForPaneId(pane_id);
+    toggle_pane_embed_or_eject_for_pane_id_with_focus(pane_id, false);
+}
+
+pub fn toggle_pane_embed_or_eject_for_pane_id_with_focus(pane_id: PaneId, show_and_focus: bool) {
+    let plugin_command = PluginCommand::TogglePaneEmbedOrEjectForPaneId(pane_id, show_and_focus);
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
@@ -3347,7 +3509,7 @@ pub fn object_to_stdout(object: &impl Serialize) {
     println!("{}", serde_json::to_string(object).unwrap());
 }
 
-/// Post a message to a worker of this plugin, for more information please see [Plugin Workers](https://zellij.dev/documentation/plugin-api-workers.md)
+/// Post a message to a worker of this plugin, for more information please see [Plugin Workers](https://zellij.dev/documentation/plugin-api-workers.html)
 pub fn post_message_to(plugin_message: PluginMessage) {
     let plugin_command = PluginCommand::PostMessageTo(plugin_message);
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
@@ -3355,7 +3517,7 @@ pub fn post_message_to(plugin_message: PluginMessage) {
     unsafe { host_run_plugin_command() };
 }
 
-/// Post a message to this plugin, for more information please see [Plugin Workers](https://zellij.dev/documentation/plugin-api-workers.md)
+/// Post a message to this plugin, for more information please see [Plugin Workers](https://zellij.dev/documentation/plugin-api-workers.html)
 pub fn post_message_to_plugin(plugin_message: PluginMessage) {
     let plugin_command = PluginCommand::PostMessageToPlugin(plugin_message);
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
